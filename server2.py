@@ -155,6 +155,59 @@ def calc_quantity(coin_price, leverage):
 
 
 # ═══════════════════════════════════════════════════════════
+#  POSITION SYNC — auto-detect manual closes on CoinDCX
+# ═══════════════════════════════════════════════════════════
+_last_sync_time = 0
+SYNC_INTERVAL = 30
+
+def sync_positions():
+    """Check CoinDCX for actual open positions. Clear any tracked positions that are already closed.
+    SAFETY: Only clears ghosts when API returns at least 1 position (proves API is working).
+    If API returns empty but we track positions, skip — API may be unreliable."""
+    global _last_sync_time
+
+    now = time.time()
+    if now - _last_sync_time < SYNC_INTERVAL:
+        return
+    _last_sync_time = now
+
+    if not active_trades:
+        return
+
+    try:
+        resp = _sign_post("/exchange/v1/derivatives/futures/positions", {})
+        if resp.status_code != 200:
+            return
+
+        positions = resp.json()
+        if not isinstance(positions, list):
+            return
+
+        open_on_exchange = set()
+        for p in positions:
+            if abs(float(p.get("quantity", 0))) > 0:
+                open_on_exchange.add(p.get("pair", ""))
+
+        # SAFETY: If API returns NO positions but we track some, don't trust it
+        if not open_on_exchange and len(active_trades) > 0:
+            return
+
+        # Find ghost positions — tracked by server but not on CoinDCX
+        ghosts = [sym for sym in active_trades if sym not in open_on_exchange]
+
+        for sym in ghosts:
+            log.info(f"👻 SYNC: {sym} no longer open on CoinDCX — clearing (manual close or TP/SL hit)")
+            log_trade_event(sym, "", "sync", "CLEARED", "position closed on CoinDCX")
+            clear_active_trade(sym, "synced — closed on CoinDCX")
+
+        if ghosts:
+            log.info(f"🔄 SYNC: cleared {len(ghosts)} ghost slots, {len(active_trades)} remain")
+
+    except Exception as e:
+        log.warning(f"⚠️ SYNC: positions check failed: {e}")
+
+
+# ═══════════════════════════════════════════════════════════
 #  WEBHOOK HANDLER
 # ═══════════════════════════════════════════════════════════
 @app.route("/webhook", methods=["POST"])
@@ -165,6 +218,9 @@ def webhook():
 
         if WEBHOOK_SECRET and data.get("secret") != WEBHOOK_SECRET:
             return jsonify({"error": "unauthorized"}), 401
+
+        # Sync positions — detect manual closes on CoinDCX
+        sync_positions()
 
         action = data.get("action", "").lower()       # buy / sell
         symbol = data.get("symbol", "")
