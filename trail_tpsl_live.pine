@@ -1,0 +1,376 @@
+//@version=5
+indicator("Trail TP/SL Rev [LIVE]", overlay=true, max_labels_count=500)
+
+// ═══════════════════════════════════════════════════════════
+//  INPUTS
+// ═══════════════════════════════════════════════════════════
+i_dir     = input.string("Short", "Start Direction", options=["Long", "Short"])
+i_tp      = input.float(3.0, "TP %", step=0.1) / 100
+i_sl      = input.float(3.0, "SL %", step=0.1) / 100
+i_book    = input.float(33.0, "Booking % of current qty", step=1) / 100
+i_maxBook = input.int(2, "Max Partial Bookings before pure trail", minval=0)
+i_minPnl  = input.float(0.0, "Min Net P&L % (kill switch, 0=off)", step=0.5, tooltip="If Return % drops below this, sends CLOSE to CoinDCX and stops all alerts. Strategy keeps running on chart. Set 0 to disable.")
+i_secret  = input.string("", "Webhook Secret")
+i_lev     = input.int(5, "Leverage", minval=1)
+i_margin  = input.string("INR", "Margin Currency", options=["INR", "USDT"])
+
+// ═══════════════════════════════════════════════════════════
+//  STATE
+// ═══════════════════════════════════════════════════════════
+var float qty      = 0.0
+var float tp       = na
+var float sl       = na
+var int   books    = 0
+var int   dir      = 0
+var float ePx      = na
+var bool  rev      = false
+
+var float cumPnL   = 0.0
+var float tradePnL = 0.0
+var float sumTpPts = 0.0
+var float sumSlPts = 0.0
+var int   slCount  = 0
+var int   tpBooks  = 0
+var int   longT    = 0
+var int   shortT   = 0
+var int   longW    = 0
+var int   shortW   = 0
+var float equity   = 10000.0
+var bool  wasKilled = false   // previous bar's killed state (for transition detection)
+
+// ── Monthly Returns Tracking ────────────────────────────────
+var array<float> monthlyReturns = array.new_float(0)
+var float prevMonthEquity       = na
+var int   prevMonth             = na
+
+// Reset flags each bar
+var bool  fEntry   = false
+var bool  fBook    = false
+var bool  fSL      = false
+var bool  fKill    = false    // transition: active → killed (send close)
+var bool  fResume  = false    // transition: killed → active (send entry)
+var int   savedDir = 0
+var float bookPct  = 0.0
+var float slPct    = 0.0
+
+fEntry  := false
+fBook   := false
+fSL     := false
+fKill   := false
+fResume := false
+
+// ═══════════════════════════════════════════════════════════
+//  PAIR NAME — TradingView → CoinDCX format
+// ═══════════════════════════════════════════════════════════
+f_cdcx_pair() =>
+    raw = syminfo.ticker
+    clean = str.contains(raw, ".P") ? str.replace(raw, ".P", "") : raw
+    base = str.replace(clean, "USDT", "")
+    "B-" + base + "_USDT"
+
+cdcxPair = f_cdcx_pair()
+
+// ═══════════════════════════════════════════════════════════
+//  FIRST BAR
+// ═══════════════════════════════════════════════════════════
+if barstate.isfirst
+    ePx      := close
+    qty      := 1.0
+    books    := 0
+    tradePnL := 0.0
+    dir      := i_dir == "Long" ? 1 : -1
+    tp       := dir == 1 ? close * (1 + i_tp) : close * (1 - i_tp)
+    sl       := dir == 1 ? close * (1 - i_sl) : close * (1 + i_sl)
+    equity   := 10000.0
+    prevMonthEquity := 10000.0
+    prevMonth       := month
+    if dir == 1
+        longT += 1
+    else
+        shortT += 1
+
+// ═══════════════════════════════════════════════════════════
+//  MONTHLY EQUITY SNAPSHOT
+// ═══════════════════════════════════════════════════════════
+if not barstate.isfirst and not na(prevMonth) and month != prevMonth
+    float snapEquity = equity
+    if qty > 0
+        snapEquity := equity * (1 + (dir == 1 ? (close[1] - ePx) / ePx : (ePx - close[1]) / ePx))
+    if not na(prevMonthEquity) and prevMonthEquity != 0
+        float moRet = (snapEquity - prevMonthEquity) / prevMonthEquity * 100
+        array.push(monthlyReturns, moRet)
+    prevMonthEquity := snapEquity
+    prevMonth       := month
+
+// ═══════════════════════════════════════════════════════════
+//  STRATEGY LOGIC — ALWAYS RUNS regardless of kill switch
+// ═══════════════════════════════════════════════════════════
+
+// ─── REVERSE ENTRY (bar after SL) ───────────────────────
+if rev and not barstate.isfirst
+    rev      := false
+    ePx      := close
+    qty      := 1.0
+    books    := 0
+    tradePnL := 0.0
+    tp       := dir == 1 ? close * (1 + i_tp) : close * (1 - i_tp)
+    sl       := dir == 1 ? close * (1 - i_sl) : close * (1 + i_sl)
+    if dir == 1
+        longT += 1
+    else
+        shortT += 1
+    fEntry := true
+
+// ─── LONG — TP chain + SL ───────────────────────────────
+if dir == 1 and qty > 0 and not rev and not barstate.isfirst
+    while high >= tp and qty > 0
+        float prevTP = tp
+        if books < i_maxBook
+            float cq    = qty * i_book
+            float bkPnL = cq * (prevTP - ePx)
+            cumPnL     += bkPnL
+            tradePnL   += bkPnL
+            sumTpPts   += bkPnL
+            qty        -= cq
+            books      += 1
+            tpBooks    += 1
+            tp := prevTP * (1 + i_tp)
+            sl := prevTP * (1 - i_sl)
+            fBook   := true
+            bookPct := i_book * 100
+        else
+            tp := prevTP * (1 + i_tp)
+            sl := prevTP
+
+    if low <= sl and qty > 0
+        float slPnL = qty * (sl - ePx)
+        cumPnL     += slPnL
+        tradePnL   += slPnL
+        sumSlPts   += slPnL
+        slCount    += 1
+        savedDir   := dir
+        slPct      := (sl - ePx) / ePx * 100
+        if tradePnL >= 0
+            longW += 1
+        equity := equity * (1 + tradePnL / ePx)
+        fSL  := true
+        qty  := 0.0
+        dir  := -1
+        rev  := true
+
+// ─── SHORT — TP chain + SL ──────────────────────────────
+if dir == -1 and qty > 0 and not rev and not barstate.isfirst
+    while low <= tp and qty > 0
+        float prevTP = tp
+        if books < i_maxBook
+            float cq    = qty * i_book
+            float bkPnL = cq * (ePx - prevTP)
+            cumPnL     += bkPnL
+            tradePnL   += bkPnL
+            sumTpPts   += bkPnL
+            qty        -= cq
+            books      += 1
+            tpBooks    += 1
+            tp := prevTP * (1 - i_tp)
+            sl := prevTP * (1 + i_sl)
+            fBook   := true
+            bookPct := i_book * 100
+        else
+            tp := prevTP * (1 - i_tp)
+            sl := prevTP
+
+    if high >= sl and qty > 0
+        float slPnL = qty * (ePx - sl)
+        cumPnL     += slPnL
+        tradePnL   += slPnL
+        sumSlPts   += slPnL
+        slCount    += 1
+        savedDir   := dir
+        slPct      := (ePx - sl) / ePx * 100
+        if tradePnL >= 0
+            shortW += 1
+        equity := equity * (1 + tradePnL / ePx)
+        fSL  := true
+        qty  := 0.0
+        dir  := 1
+        rev  := true
+
+// ═══════════════════════════════════════════════════════════
+//  KILL SWITCH — live gate, checked every bar
+//  NOT permanent: if return recovers above threshold, alerts resume
+// ═══════════════════════════════════════════════════════════
+float curEquityLive = equity
+if qty > 0 and not na(ePx) and ePx > 0
+    curEquityLive := equity * (1 + (dir == 1 ? (close - ePx) / ePx : (ePx - close) / ePx))
+float returnPctLive = (curEquityLive - 10000.0) / 10000.0 * 100
+
+// Live check — killed is recalculated every bar, not sticky
+bool killed = i_minPnl != 0.0 and returnPctLive < i_minPnl
+
+// Detect transitions
+if killed and not wasKilled
+    fKill := true   // just became killed → send close to CoinDCX
+if not killed and wasKilled
+    fResume := true // just recovered → send entry to CoinDCX
+wasKilled := killed
+
+// ═══════════════════════════════════════════════════════════
+//  RETURN % (for dashboard)
+// ═══════════════════════════════════════════════════════════
+float openPnL = 0.0
+if qty > 0 and not na(ePx) and ePx > 0
+    openPnL := dir == 1 ? qty * (close - ePx) : qty * (ePx - close)
+
+float curEquity = curEquityLive
+float returnPct = returnPctLive
+
+// ═══════════════════════════════════════════════════════════
+//  WEBHOOK JSON
+// ═══════════════════════════════════════════════════════════
+entryAction = dir == 1 ? "buy" : "sell"
+entryJson = '{"action":"' + entryAction + '","symbol":"' + cdcxPair + '","type":"entry","price":"' + str.tostring(close) + '","leverage":"' + str.tostring(i_lev) + '","margin_currency":"' + i_margin + '","tp_price":"' + str.tostring(tp) + '","sl_price":"' + str.tostring(sl) + '","secret":"' + i_secret + '"}'
+
+bookCloseAction = dir == 1 ? "sell" : "buy"
+bookJson = '{"action":"' + bookCloseAction + '","symbol":"' + cdcxPair + '","type":"book","price":"' + str.tostring(close) + '","leverage":"' + str.tostring(i_lev) + '","margin_currency":"' + i_margin + '","tp_price":"' + str.tostring(tp) + '","sl_price":"' + str.tostring(sl) + '","book_pct":"' + str.tostring(bookPct) + '","secret":"' + i_secret + '"}'
+
+reverseAction = dir == 1 ? "buy" : "sell"
+newTp = dir == 1 ? close * (1 + i_tp) : close * (1 - i_tp)
+newSl = dir == 1 ? close * (1 - i_sl) : close * (1 + i_sl)
+reverseJson = '{"action":"' + reverseAction + '","symbol":"' + cdcxPair + '","type":"reverse","price":"' + str.tostring(close) + '","leverage":"' + str.tostring(i_lev) + '","margin_currency":"' + i_margin + '","tp_price":"' + str.tostring(newTp) + '","sl_price":"' + str.tostring(newSl) + '","secret":"' + i_secret + '"}'
+
+// Kill — close position on CoinDCX, free the slot
+killCloseAction = dir == 1 ? "sell" : "buy"
+killJson = '{"action":"' + killCloseAction + '","symbol":"' + cdcxPair + '","type":"close","price":"' + str.tostring(close) + '","leverage":"' + str.tostring(i_lev) + '","margin_currency":"' + i_margin + '","reason":"kill_switch","return_pct":"' + str.tostring(returnPctLive, "#.##") + '","secret":"' + i_secret + '"}'
+
+// Resume — return recovered above threshold, re-enter current direction
+resumeAction = dir == 1 ? "buy" : "sell"
+resumeTp = dir == 1 ? tp : tp
+resumeSl = dir == 1 ? sl : sl
+resumeJson = '{"action":"' + resumeAction + '","symbol":"' + cdcxPair + '","type":"entry","price":"' + str.tostring(close) + '","leverage":"' + str.tostring(i_lev) + '","margin_currency":"' + i_margin + '","tp_price":"' + str.tostring(tp) + '","sl_price":"' + str.tostring(sl) + '","secret":"' + i_secret + '"}'
+
+// ═══════════════════════════════════════════════════════════
+//  ALERTS — kill switch only gates these, nothing else
+// ═══════════════════════════════════════════════════════════
+if fKill and barstate.isconfirmed
+    alert(killJson, alert.freq_once_per_bar)
+
+if fResume and barstate.isconfirmed
+    alert(resumeJson, alert.freq_once_per_bar)
+
+if fEntry and not killed and barstate.isconfirmed
+    alert(entryJson, alert.freq_once_per_bar)
+
+if fBook and not fSL and not killed and barstate.isconfirmed
+    alert(bookJson, alert.freq_once_per_bar)
+
+if fSL and not killed and barstate.isconfirmed
+    alert(reverseJson, alert.freq_once_per_bar)
+
+// ═══════════════════════════════════════════════════════════
+//  LABELS — always print regardless of kill switch
+// ═══════════════════════════════════════════════════════════
+if fEntry
+    lbl = dir == 1 ? "▲ LONG" : "▼ SHORT"
+    col = dir == 1 ? color.green : color.red
+    label.new(bar_index, dir == 1 ? low : high,
+     lbl + "\n" + str.tostring(close, "#.########"),
+     color=col, textcolor=color.white, size=size.small,
+     style=dir == 1 ? label.style_label_up : label.style_label_down)
+
+if fSL
+    col = slPct >= 0 ? color.green : color.red
+    tag = (slPct >= 0 ? "TP" : "SL") + " " + str.tostring(slPct, "#.##") + "%"
+    label.new(bar_index, savedDir == 1 ? high : low,
+     tag, color=col, textcolor=color.white, size=size.tiny,
+     style=savedDir == 1 ? label.style_label_down : label.style_label_up)
+
+if fBook and not fSL
+    label.new(bar_index, dir == 1 ? high : low,
+     "📦 Book " + str.tostring(books),
+     color=color.new(#2196f3, 0), textcolor=color.white, size=size.tiny,
+     style=dir == 1 ? label.style_label_down : label.style_label_up)
+
+// ═══════════════════════════════════════════════════════════
+//  PLOTS — always show
+// ═══════════════════════════════════════════════════════════
+plot(qty > 0 ? tp : na, "TP", color.new(#00e676, 0), style=plot.style_stepline)
+plot(qty > 0 ? sl : na, "SL", color.new(#ff1744, 0), style=plot.style_stepline)
+bgcolor(dir == 1 ? color.new(#00e676, 95) : color.new(#ff1744, 95))
+
+// ═══════════════════════════════════════════════════════════
+//  DASHBOARD — 22-row top_right
+// ═══════════════════════════════════════════════════════════
+var table dash = table.new(position.top_right, 2, 22, bgcolor=color.new(#1a1a2e, 0), border_color=color.new(#333333, 0), border_width=1)
+
+f_cell(int r, string lbl, string val, color clr) =>
+    table.cell(dash, 0, r, lbl, text_color=#aaaaaa, text_size=size.small, text_halign=text.align_left)
+    table.cell(dash, 1, r, val, text_color=clr,     text_size=size.small, text_halign=text.align_right)
+
+if barstate.islast
+    wr      = slCount > 0 ? (longW + shortW) * 100.0 / slCount : 0.0
+    longWR  = longT > 0 ? longW * 100.0 / longT : 0.0
+    shortWR = shortT > 0 ? shortW * 100.0 / shortT : 0.0
+
+    curPnlPct = qty > 0 and ePx > 0 ? (dir == 1 ? (close - ePx) / ePx * 100 : (ePx - close) / ePx * 100) : 0.0
+    netPnL = cumPnL + openPnL
+    pnlCol = netPnL >= 0 ? #00e676 : #ff1744
+    wrCol  = wr >= 60 ? color.new(#00c853, 0) : wr >= 50 ? color.new(#ffd600, 0) : color.new(#ff1744, 0)
+    cpCol  = curPnlPct >= 0 ? #00e676 : #ff1744
+
+    f_cell(0, "Strategy", "Trail TP/SL [LIVE]", #5ffae0)
+    f_cell(1, "Pair", cdcxPair, #5ffae0)
+    f_cell(2, "Start Dir", i_dir, color.white)
+    f_cell(3, "Total Trades", str.tostring(slCount), color.white)
+    f_cell(4, "Long / Short", str.tostring(longT) + " / " + str.tostring(shortT), color.white)
+
+    table.cell(dash, 0, 5, "Win Rate", text_color=#aaaaaa, text_size=size.small, text_halign=text.align_left)
+    table.cell(dash, 1, 5, str.tostring(wr, "#.#") + "%", text_color=color.white, text_size=size.small, text_halign=text.align_right, bgcolor=wrCol)
+
+    f_cell(6, "Long WR%", str.tostring(longWR, "#.#") + "%", longWR >= 50 ? #00e676 : #ff1744)
+    f_cell(7, "Short WR%", str.tostring(shortWR, "#.#") + "%", shortWR >= 50 ? #00e676 : #ff1744)
+    f_cell(8, "TP Books", str.tostring(tpBooks), #00e676)
+    f_cell(9, "SL Hits", str.tostring(slCount), #ff1744)
+    f_cell(10, "Sum TP Pts", "+" + str.tostring(sumTpPts, "#.##"), #00e676)
+    f_cell(11, "Sum SL Pts", str.tostring(sumSlPts, "#.##"), #ff1744)
+
+    netSign = netPnL >= 0 ? "+" : ""
+    f_cell(12, "Net P&L", netSign + str.tostring(netPnL, "#.##"), pnlCol)
+
+    f_cell(13, "TP% / SL%", str.tostring(i_tp * 100, "#.#") + "% / " + str.tostring(i_sl * 100, "#.#") + "%", color.white)
+    f_cell(14, "Max Books", str.tostring(i_maxBook), color.white)
+    f_cell(15, "Books Done", str.tostring(books) + " / " + str.tostring(i_maxBook), color.white)
+    f_cell(16, "Cur P&L%", qty > 0 ? str.tostring(curPnlPct, "#.##") + "%" : "—", cpCol)
+
+    // State — shows KILLED if alerts stopped, but strategy keeps running
+    if killed
+        table.cell(dash, 0, 17, "State", text_color=#aaaaaa, text_size=size.small, text_halign=text.align_left)
+        table.cell(dash, 1, 17, "☠️ KILLED", text_color=color.white, text_size=size.small, text_halign=text.align_right, bgcolor=color.new(#ff0000, 0))
+    else
+        f_cell(17, "State", dir == 1 ? "LONG" : "SHORT", dir == 1 ? #00e676 : #ff1744)
+
+    eqCol = curEquity >= 10000.0 ? #00e676 : #ff1744
+    table.cell(dash, 0, 18, "Equity ($)", text_color=#aaaaaa, text_size=size.small, text_halign=text.align_left)
+    table.cell(dash, 1, 18, "$" + str.tostring(curEquity, "#.##"), text_color=eqCol, text_size=size.small, text_halign=text.align_right, bgcolor=curEquity >= 10000.0 ? color.new(#00c853, 80) : color.new(#ff1744, 80))
+
+    retSign = returnPct >= 0 ? "+" : ""
+    retCol = returnPct >= 0 ? #00e676 : #ff1744
+    table.cell(dash, 0, 19, "Return %", text_color=#aaaaaa, text_size=size.small, text_halign=text.align_left)
+    table.cell(dash, 1, 19, retSign + str.tostring(returnPct, "#.##") + "%", text_color=retCol, text_size=size.small, text_halign=text.align_right, bgcolor=returnPct >= 0 ? color.new(#00c853, 80) : color.new(#ff1744, 80))
+
+    // Avg Monthly Return %
+    float curMonthStart = not na(prevMonthEquity) ? prevMonthEquity : 10000.0
+    if curMonthStart != 0
+        float curMoRet = (curEquity - curMonthStart) / curMonthStart * 100
+        array.push(monthlyReturns, curMoRet)
+    int   moCount  = array.size(monthlyReturns)
+    float avgMoRet = moCount > 0 ? array.avg(monthlyReturns) : 0.0
+    string avgMoSign = avgMoRet >= 0 ? "+" : ""
+    color  avgMoCol  = avgMoRet >= 0 ? #00e676 : #ff1744
+    table.cell(dash, 0, 20, "Avg Mo Ret%", text_color=#aaaaaa, text_size=size.small, text_halign=text.align_left)
+    table.cell(dash, 1, 20, avgMoSign + str.tostring(avgMoRet, "#.##") + "% (" + str.tostring(moCount) + "mo)", text_color=avgMoCol, text_size=size.small, text_halign=text.align_right, bgcolor=avgMoRet >= 0 ? color.new(#00c853, 80) : color.new(#ff1744, 80))
+    if moCount > 0
+        array.pop(monthlyReturns)
+
+    // Min P&L threshold
+    minPnlStr = i_minPnl == 0.0 ? "OFF" : str.tostring(i_minPnl, "#.#") + "%"
+    f_cell(21, "Min P&L", minPnlStr, i_minPnl == 0.0 ? #aaaaaa : (killed ? #ff1744 : #ff9800))
