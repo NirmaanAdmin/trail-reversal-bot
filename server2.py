@@ -255,23 +255,12 @@ def webhook():
                 log_trade_event(symbol, action, "entry", "REJECT", "qty=0")
                 return jsonify({"error": "invalid quantity"}), 400
 
-            # Calculate TP/SL from Pine's values or from env defaults
-            tp_pct = float(os.environ.get("TP_PCT", "3.0")) / 100
-            sl_pct = float(os.environ.get("SL_PCT", "3.0")) / 100
-            if action == "buy":
-                raw_tp = tp_price or coin_price * (1 + tp_pct)
-                raw_sl = sl_price or coin_price * (1 - sl_pct)
-            else:
-                raw_tp = tp_price or coin_price * (1 - tp_pct)
-                raw_sl = sl_price or coin_price * (1 + sl_pct)
-            final_tp, final_sl = round_tp_sl(coin_price, raw_tp, raw_sl, action, symbol)
-
-            log.info(f"🚀 ENTRY {action.upper()} {quantity} {symbol} ({leverage}x) | TP={final_tp} SL={final_sl}")
+            # No TP/SL on entry — Pine handles all exits (book/reverse/kill)
+            log.info(f"🚀 ENTRY {action.upper()} {quantity} {symbol} ({leverage}x) | NO TP/SL (Pine-driven)")
             result = client.place_order(
                 pair=symbol, side=action, order_type="market_order",
                 total_quantity=quantity, leverage=leverage,
-                margin_currency=margin_ccy,
-                tp_price=final_tp, sl_price=final_sl
+                margin_currency=margin_ccy
             )
 
             if isinstance(result, dict) and result.get("status") == "error":
@@ -282,8 +271,8 @@ def webhook():
 
             order_id = result.get("id", "unknown") if isinstance(result, dict) else "unknown"
             filled_qty = float(result.get("total_quantity", quantity)) if isinstance(result, dict) else quantity
-            set_active_trade(symbol, action, filled_qty, coin_price, order_id, final_tp, final_sl)
-            log_trade_event(symbol, action, "entry", "FILLED", f"TP={final_tp} SL={final_sl}")
+            set_active_trade(symbol, action, filled_qty, coin_price, order_id)
+            log_trade_event(symbol, action, "entry", "FILLED", "Pine-driven, no TP/SL")
             return jsonify({"status": "success", "order": result}), 200
 
         # ─── BOOK — partial TP booking + trail TP/SL ────────────
@@ -320,21 +309,6 @@ def webhook():
             trade["books_done"] += 1
             log.info(f"✅ Booked {book_qty} {symbol} — remaining qty: {trade['qty']}")
 
-            # Trail TP/SL if Pine sent new levels
-            if tp_price and sl_price:
-                new_tp, new_sl = round_tp_sl(trade["entry_price"], tp_price, sl_price, trade["side"], symbol)
-                trade["tp_price"] = new_tp
-                trade["sl_price"] = new_sl
-                log.info(f"📏 Trailing TP/SL → TP={new_tp} SL={new_sl}")
-
-                # Update on CoinDCX via create_tpsl
-                client.set_tp_sl(
-                    pair=symbol, side=trade["side"],
-                    quantity=trade["qty"],
-                    tp_price=new_tp, sl_price=new_sl,
-                    leverage=leverage, margin_currency=margin_ccy
-                )
-
             log_trade_event(symbol, action, "book", "FILLED", f"book #{trade['books_done']}, remaining={trade['qty']:.4f}")
             return jsonify({"status": "booked", "remaining_qty": trade["qty"]}), 200
 
@@ -363,29 +337,17 @@ def webhook():
             # Small delay for CoinDCX to settle
             time.sleep(1)
 
-            # Open new position in opposite direction
+            # Open new position in opposite direction — no TP/SL, Pine drives exits
             quantity = calc_quantity(coin_price, leverage)
             if quantity <= 0:
                 log.error(f"❌ REJECT reverse entry: {symbol} — qty=0")
                 return jsonify({"error": "reverse entry qty=0"}), 400
 
-            # action = new direction (Pine sends buy/sell for the NEW leg)
-            tp_pct = float(os.environ.get("TP_PCT", "3.0")) / 100
-            sl_pct = float(os.environ.get("SL_PCT", "3.0")) / 100
-            if action == "buy":
-                raw_tp = tp_price or coin_price * (1 + tp_pct)
-                raw_sl = sl_price or coin_price * (1 - sl_pct)
-            else:
-                raw_tp = tp_price or coin_price * (1 - tp_pct)
-                raw_sl = sl_price or coin_price * (1 + sl_pct)
-            final_tp, final_sl = round_tp_sl(coin_price, raw_tp, raw_sl, action, symbol)
-
-            log.info(f"🔄 REVERSE entry: {action.upper()} {quantity} {symbol} | TP={final_tp} SL={final_sl}")
+            log.info(f"🔄 REVERSE entry: {action.upper()} {quantity} {symbol} | NO TP/SL (Pine-driven)")
             result = client.place_order(
                 pair=symbol, side=action, order_type="market_order",
                 total_quantity=quantity, leverage=leverage,
-                margin_currency=margin_ccy,
-                tp_price=final_tp, sl_price=final_sl
+                margin_currency=margin_ccy
             )
 
             if isinstance(result, dict) and result.get("status") == "error":
@@ -396,8 +358,8 @@ def webhook():
 
             order_id = result.get("id", "unknown") if isinstance(result, dict) else "unknown"
             filled_qty = float(result.get("total_quantity", quantity)) if isinstance(result, dict) else quantity
-            set_active_trade(symbol, action, filled_qty, coin_price, order_id, final_tp, final_sl)
-            log_trade_event(symbol, action, "reverse_entry", "FILLED", f"TP={final_tp} SL={final_sl}")
+            set_active_trade(symbol, action, filled_qty, coin_price, order_id)
+            log_trade_event(symbol, action, "reverse_entry", "FILLED", "Pine-driven, no TP/SL")
             return jsonify({"status": "reversed", "order": result}), 200
 
         # ─── CLOSE — kill switch, close position and free slot ──
