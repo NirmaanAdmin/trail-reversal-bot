@@ -218,12 +218,24 @@ def _find_position_id(symbol, max_wait=30, interval=3):
                 positions = resp.json()
                 if isinstance(positions, list):
                     for p in positions:
-                        if p.get("pair") == symbol and abs(float(p.get("quantity", 0))) > 0.0001:
-                            return p.get("id")
+                        pair = p.get("pair", "")
+                        # Try multiple possible qty field names
+                        qty = abs(float(p.get("quantity", 0) or p.get("active_pos", 0) or 0))
+                        if pair == symbol and qty > 0.0001:
+                            pos_id = p.get("id")
+                            log.info(f"📍 Found position {pos_id} for {symbol} after {elapsed}s")
+                            return pos_id
+                    # Debug: log what pairs we see
+                    found_pairs = [p.get("pair","?") for p in positions if abs(float(p.get("quantity", 0) or p.get("active_pos", 0) or 0)) > 0]
+                    if elapsed == 0:
+                        log.info(f"🔍 SL search for {symbol} — open pairs on CoinDCX: {found_pairs}")
+                        if positions:
+                            log.info(f"🔍 Sample position keys: {list(positions[0].keys())}")
         except Exception as e:
             log.warning(f"⚠️ Position poll error: {e}")
         time.sleep(interval)
         elapsed += interval
+    log.warning(f"⚠️ _find_position_id timed out for {symbol} after {max_wait}s")
     return None
 
 
