@@ -152,7 +152,7 @@ def set_active_trade(pair, side, qty, entry_price, order_id, tp_price=None, sl_p
 def clear_active_trade(pair, reason=""):
     old = active_trades.pop(pair, None)
     if old:
-        native_sl_orders.pop(pair, None)  # position-attached SL auto-cancels
+        cancel_native_sl(pair)
         log.info(f"🔓 Cleared: {pair} — {reason}")
 
 
@@ -165,107 +165,57 @@ def calc_quantity(coin_price, leverage):
 
 
 # ═══════════════════════════════════════════════════════════
-#  NATIVE SL — uses CoinDCX create_tpsl endpoint (position-attached)
-#  Shows in CoinDCX UI, auto-cancels on position close
+#  NATIVE SL — standalone stop-market order (no position ID needed)
+#  Works with INR-margin positions
 # ═══════════════════════════════════════════════════════════
-native_sl_orders = {}  # {symbol: {"sl_price": ...}}
+native_sl_orders = {}  # {symbol: {"order_id": "...", "sl_price": ...}}
 
 def place_native_sl(symbol, side, qty, sl_price, leverage, margin_ccy):
-    """Place SL on CoinDCX using create_tpsl endpoint (attached to position)."""
-    import threading
+    """Place a standalone stop-market SL order on CoinDCX."""
+    cancel_native_sl(symbol)
 
+    sl_side = "sell" if side == "buy" else "buy"
     sl_price = tick_round_sl(sl_price, sl_price, side, symbol)
 
-    def _place_sl_worker():
-        try:
-            # Find position ID
-            position_id = _find_position_id(symbol)
-            if not position_id:
-                log.warning(f"⚠️ Native SL: can't find position for {symbol}")
-                return
+    try:
+        result = client.place_order(
+            pair=symbol, side=sl_side, order_type="market_order",
+            total_quantity=qty, leverage=leverage,
+            stop_price=sl_price, margin_currency=margin_ccy
+        )
 
-            body = {
-                "id": position_id,
-                "stop_loss": {
-                    "stop_price": str(sl_price),
-                    "order_type": "stop_market"
-                }
-            }
-            resp = _sign_post("/exchange/v1/derivatives/futures/positions/create_tpsl", body)
-            result = resp.json() if resp.status_code == 200 else {}
+        if isinstance(result, dict) and result.get("status") == "error":
+            log.warning(f"\u26a0\ufe0f Native SL failed for {symbol}: {result.get('message', '')}")
+            return
 
-            if isinstance(result, dict) and result.get("status") == "error":
-                log.warning(f"⚠️ Native SL failed for {symbol}: {result.get('message', '')}")
-                return
+        order_id = result.get("id", "unknown") if isinstance(result, dict) else "unknown"
+        native_sl_orders[symbol] = {"order_id": order_id, "sl_price": sl_price}
+        log.info(f"\U0001f6e1\ufe0f Native SL placed: {symbol} {sl_side.upper()} {qty} @ stop={sl_price} | order={order_id}")
 
-            native_sl_orders[symbol] = {"sl_price": sl_price}
-            log.info(f"🛡️ Native SL set: {symbol} @ {sl_price} (position-attached)")
-
-        except Exception as e:
-            log.warning(f"⚠️ Native SL error for {symbol}: {e}")
-
-    thread = threading.Thread(target=_place_sl_worker, daemon=True)
-    thread.start()
-
-
-def _find_position_id(symbol, max_wait=30, interval=3):
-    """Poll for position ID, up to max_wait seconds."""
-    elapsed = 0
-    while elapsed < max_wait:
-        try:
-            resp = _sign_post("/exchange/v1/derivatives/futures/positions", {})
-            if resp.status_code == 200:
-                positions = resp.json()
-                if isinstance(positions, list):
-                    for p in positions:
-                        pair = p.get("pair", "")
-                        # Try multiple possible qty field names
-                        qty = abs(float(p.get("quantity", 0) or p.get("active_pos", 0) or 0))
-                        if pair == symbol and qty > 0.0001:
-                            pos_id = p.get("id")
-                            log.info(f"📍 Found position {pos_id} for {symbol} after {elapsed}s")
-                            return pos_id
-                    # Debug: log what pairs we see
-                    found_pairs = [p.get("pair","?") for p in positions if abs(float(p.get("quantity", 0) or p.get("active_pos", 0) or 0)) > 0]
-                    if elapsed == 0:
-                        log.info(f"🔍 SL search for {symbol} — open pairs on CoinDCX: {found_pairs}")
-                        if positions:
-                            log.info(f"🔍 Sample position keys: {list(positions[0].keys())}")
-        except Exception as e:
-            log.warning(f"⚠️ Position poll error: {e}")
-        time.sleep(interval)
-        elapsed += interval
-    log.warning(f"⚠️ _find_position_id timed out for {symbol} after {max_wait}s")
-    return None
+    except Exception as e:
+        log.warning(f"\u26a0\ufe0f Native SL error for {symbol}: {e}")
 
 
 def cancel_native_sl(symbol):
-    """Cancel existing native SL. With create_tpsl, SL is position-attached
-    and auto-cancels when position closes. Manual cancel only needed for updates."""
+    """Cancel existing native SL order."""
     if symbol not in native_sl_orders:
         return
 
+    order_info = native_sl_orders.pop(symbol)
+    order_id = order_info.get("order_id", "")
+
+    if not order_id or order_id == "unknown":
+        return
+
     try:
-        position_id = _find_position_id(symbol, max_wait=5, interval=2)
-        if not position_id:
-            native_sl_orders.pop(symbol, None)
-            return
-
-        # Remove SL by setting it to None via create_tpsl with no stop_loss
-        body = {
-            "id": position_id,
-            "stop_loss": None
-        }
-        resp = _sign_post("/exchange/v1/derivatives/futures/positions/create_tpsl", body)
+        body = {"id": order_id}
+        resp = _sign_post("/exchange/v1/derivatives/futures/orders/cancel", body)
         if resp.status_code == 200:
-            log.info(f"🛡️ Native SL cleared: {symbol}")
+            log.info(f"\U0001f6e1\ufe0f Native SL cancelled: {symbol} | order={order_id}")
         else:
-            log.warning(f"⚠️ Native SL clear may have failed: {symbol}")
-
+            log.warning(f"\u26a0\ufe0f Native SL cancel may have failed: {symbol} — likely already filled")
     except Exception as e:
-        log.warning(f"⚠️ Native SL cancel error for {symbol}: {e}")
-
-    native_sl_orders.pop(symbol, None)
+        log.warning(f"\u26a0\ufe0f Native SL cancel error for {symbol}: {e}")
 
 
 # ═══════════════════════════════════════════════════════════
@@ -355,7 +305,7 @@ def execute_trail_shift(symbol, trade):
     log.info(f"🔄 SERVER TRAIL: {symbol} | new TP={new_tp:.6f} SL={new_sl:.6f}")
     log_trade_event(symbol, "", "server_trail", "SHIFTED", f"TP={new_tp:.6f} SL={new_sl:.6f}")
 
-    # Update native SL on CoinDCX (create_tpsl overwrites existing)
+    # Update native SL on CoinDCX
     place_native_sl(symbol, trade["side"], trade["qty"], new_sl, leverage, margin_ccy)
 
 
@@ -366,8 +316,8 @@ def execute_sl_close(symbol, trade):
     leverage = trade.get("leverage", DEFAULT_LEVERAGE)
     margin_ccy = trade.get("margin_ccy", DEFAULT_MARGIN)
 
-    # Native SL auto-cancels when position closes — no manual cancel needed
-    native_sl_orders.pop(symbol, None)
+    # Cancel native SL order on CoinDCX
+    cancel_native_sl(symbol)
 
     if close_qty <= 0:
         clear_active_trade(symbol, "SL hit — qty already 0")
@@ -604,8 +554,8 @@ def webhook():
         # ─── REVERSE — SL hit, close remaining + open opposite ──
         elif alert_type == "reverse":
             with trade_lock:
-                # Position-attached SL auto-cancels on close
-                native_sl_orders.pop(symbol, None)
+                # Cancel standalone SL order
+                cancel_native_sl(symbol)
 
                 if symbol in active_trades:
                     trade = active_trades[symbol]
@@ -675,7 +625,7 @@ def webhook():
             log.info(f"☠️ KILL SWITCH: {symbol} — reason={reason}, return={ret_pct}%")
 
             with trade_lock:
-                native_sl_orders.pop(symbol, None)
+                cancel_native_sl(symbol)
 
                 if symbol in active_trades:
                     trade = active_trades[symbol]
