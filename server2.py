@@ -15,6 +15,7 @@ API_SECRET = os.environ.get("COINDCX_API_SECRET", "")
 WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET", "")
 DEFAULT_LEVERAGE = int(os.environ.get("DEFAULT_LEVERAGE", "5"))
 DEFAULT_MARGIN = os.environ.get("DEFAULT_MARGIN", "INR")
+FALLBACK_SL_PCT = float(os.environ.get("FALLBACK_SL_PCT", "8")) / 100  # disaster recovery SL, default 8%
 
 app = Flask(__name__)
 client = CoinDCXFutures(API_KEY, API_SECRET)
@@ -143,6 +144,8 @@ def set_active_trade(pair, side, qty, entry_price, order_id, tp_price=None, sl_p
 def clear_active_trade(pair, reason=""):
     old = active_trades.pop(pair, None)
     if old:
+        # Also cancel any lingering fallback SL
+        cancel_fallback_sl(pair)
         log.info(f"🔓 Cleared: {pair} — {reason}")
 
 def calc_quantity(coin_price, leverage):
@@ -152,6 +155,87 @@ def calc_quantity(coin_price, leverage):
     available_usdt = (FIXED_MARGIN_INR * WALLET_USAGE_PCT) / USDT_INR_RATE
     raw_qty = (available_usdt * leverage) / coin_price
     return round_down_quantity(raw_qty, coin_price)
+
+
+# ═══════════════════════════════════════════════════════════
+#  FALLBACK SL — disaster recovery if TradingView goes down
+#  Placed wide (default 8%) so Pine's normal 3% SL always
+#  fires first. Only triggers if alerts stop flowing.
+# ═══════════════════════════════════════════════════════════
+# {symbol: {"order_id": "...", "sl_price": ...}}
+fallback_sl_orders = {}
+
+def place_fallback_sl(symbol, side, qty, entry_price, leverage, margin_ccy):
+    """Place a wide SL on CoinDCX as disaster recovery."""
+    if FALLBACK_SL_PCT <= 0:
+        return
+
+    # Calculate fallback SL price — always WIDER than Pine's SL
+    if side == "buy":
+        sl_price = entry_price * (1 - FALLBACK_SL_PCT)
+    else:
+        sl_price = entry_price * (1 + FALLBACK_SL_PCT)
+
+    # Round to tick
+    tick = get_tick_size(symbol)
+    if not tick:
+        tick = infer_tick_from_price(entry_price)
+    if entry_price >= 1.0:
+        tick = max(tick, 0.001)
+
+    if side == "buy":
+        sl_price = round_to_tick(sl_price, tick)
+    else:
+        sl_price = round_up_to_tick(sl_price, tick)
+
+    # Close side for SL
+    sl_side = "sell" if side == "buy" else "buy"
+
+    try:
+        body = {
+            "pair": symbol,
+            "side": sl_side,
+            "order_type": "market_order",
+            "stop_price": sl_price,
+            "total_quantity": qty,
+            "leverage": leverage,
+            "margin_currency": margin_ccy,
+        }
+        resp = _sign_post("/exchange/v1/derivatives/futures/orders/create", body)
+        result = resp.json() if resp.status_code == 200 else {}
+
+        if isinstance(result, dict) and result.get("status") == "error":
+            log.warning(f"⚠️ Fallback SL failed for {symbol}: {result.get('message', '')}")
+            return
+
+        order_id = result.get("id", "unknown") if isinstance(result, dict) else "unknown"
+        fallback_sl_orders[symbol] = {"order_id": order_id, "sl_price": sl_price}
+        log.info(f"🛡️ Fallback SL placed: {symbol} {sl_side.upper()} {qty} @ stop={sl_price} ({FALLBACK_SL_PCT*100:.0f}% from entry) | order={order_id}")
+
+    except Exception as e:
+        log.warning(f"⚠️ Fallback SL error for {symbol}: {e}")
+
+
+def cancel_fallback_sl(symbol):
+    """Cancel existing fallback SL order on CoinDCX."""
+    if symbol not in fallback_sl_orders:
+        return
+
+    order_info = fallback_sl_orders.pop(symbol)
+    order_id = order_info.get("order_id", "")
+
+    if not order_id or order_id == "unknown":
+        return
+
+    try:
+        body = {"id": order_id}
+        resp = _sign_post("/exchange/v1/derivatives/futures/orders/cancel", body)
+        if resp.status_code == 200:
+            log.info(f"🛡️ Fallback SL cancelled: {symbol} | order={order_id}")
+        else:
+            log.warning(f"⚠️ Fallback SL cancel may have failed: {symbol} (status {resp.status_code}) — likely already filled or cancelled")
+    except Exception as e:
+        log.warning(f"⚠️ Fallback SL cancel error for {symbol}: {e}")
 
 
 # ═══════════════════════════════════════════════════════════
@@ -273,6 +357,10 @@ def webhook():
             filled_qty = float(result.get("total_quantity", quantity)) if isinstance(result, dict) else quantity
             set_active_trade(symbol, action, filled_qty, coin_price, order_id)
             log_trade_event(symbol, action, "entry", "FILLED", "Pine-driven, no TP/SL")
+
+            # Place fallback SL as disaster recovery
+            place_fallback_sl(symbol, action, filled_qty, coin_price, leverage, margin_ccy)
+
             return jsonify({"status": "success", "order": result}), 200
 
         # ─── BOOK — partial TP booking + trail TP/SL ────────────
@@ -287,6 +375,9 @@ def webhook():
             if book_qty <= 0:
                 log.info(f"⚠️ SKIP book: {symbol} — book qty too small")
                 return jsonify({"status": "skipped", "reason": "book qty too small"}), 200
+
+            # Cancel old fallback SL before modifying position
+            cancel_fallback_sl(symbol)
 
             # Close partial qty at market (opposite side to close)
             close_side = "sell" if trade["side"] == "buy" else "buy"
@@ -310,10 +401,18 @@ def webhook():
             log.info(f"✅ Booked {book_qty} {symbol} — remaining qty: {trade['qty']}")
 
             log_trade_event(symbol, action, "book", "FILLED", f"book #{trade['books_done']}, remaining={trade['qty']:.4f}")
+
+            # Re-place fallback SL with updated remaining qty
+            if trade["qty"] > 0:
+                place_fallback_sl(symbol, trade["side"], trade["qty"], trade["entry_price"], leverage, margin_ccy)
+
             return jsonify({"status": "booked", "remaining_qty": trade["qty"]}), 200
 
         # ─── REVERSE — SL hit, close remaining + open opposite ──
         elif alert_type == "reverse":
+            # Cancel old fallback SL before closing position
+            cancel_fallback_sl(symbol)
+
             if symbol in active_trades:
                 trade = active_trades[symbol]
                 close_side = "sell" if trade["side"] == "buy" else "buy"
@@ -360,6 +459,10 @@ def webhook():
             filled_qty = float(result.get("total_quantity", quantity)) if isinstance(result, dict) else quantity
             set_active_trade(symbol, action, filled_qty, coin_price, order_id)
             log_trade_event(symbol, action, "reverse_entry", "FILLED", "Pine-driven, no TP/SL")
+
+            # Place fallback SL for new reversed position
+            place_fallback_sl(symbol, action, filled_qty, coin_price, leverage, margin_ccy)
+
             return jsonify({"status": "reversed", "order": result}), 200
 
         # ─── CLOSE — kill switch, close position and free slot ──
@@ -367,6 +470,9 @@ def webhook():
             reason = data.get("reason", "unknown")
             ret_pct = data.get("return_pct", "?")
             log.info(f"☠️ KILL SWITCH: {symbol} — reason={reason}, return={ret_pct}%")
+
+            # Cancel fallback SL before closing
+            cancel_fallback_sl(symbol)
 
             if symbol in active_trades:
                 trade = active_trades[symbol]
@@ -406,6 +512,7 @@ def webhook():
 def status():
     return jsonify({
         "active_trades": active_trades,
+        "fallback_sl_orders": fallback_sl_orders,
         "positions": len(active_trades),
         "time": datetime.now().isoformat()
     })
@@ -430,6 +537,9 @@ def clear_lock():
         clear_active_trade(symbol, "manual clear")
         return jsonify({"status": "ok", "cleared": symbol})
     else:
+        # Cancel all fallback SLs
+        for sym in list(fallback_sl_orders.keys()):
+            cancel_fallback_sl(sym)
         count = len(active_trades)
         active_trades.clear()
         return jsonify({"status": "ok", "cleared": count})
@@ -472,4 +582,5 @@ recover_active_trades()
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     log.info(f"🤖 Trailing TP/SL Reversal Bot starting on port {port}")
+    log.info(f"🛡️ Fallback SL: {FALLBACK_SL_PCT*100:.0f}% (disaster recovery)")
     app.run(host="0.0.0.0", port=port)
