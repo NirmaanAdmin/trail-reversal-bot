@@ -158,29 +158,10 @@ def calc_quantity(coin_price, leverage):
 native_sl_orders = {}  # {symbol: {"order_id": "...", "sl_price": ...}}
 
 def place_native_sl(symbol, side, qty, sl_price, leverage, margin_ccy):
-    """Place a standalone stop-market SL order on CoinDCX."""
-    cancel_native_sl(symbol)
-
-    sl_side = "sell" if side == "buy" else "buy"
-    sl_price = tick_round_sl(sl_price, sl_price, side, symbol)
-
-    try:
-        result = client.place_order(
-            pair=symbol, side=sl_side, order_type="market_order",
-            total_quantity=qty, leverage=leverage,
-            stop_price=sl_price, margin_currency=margin_ccy
-        )
-
-        if isinstance(result, dict) and result.get("status") == "error":
-            log.warning(f"⚠️ Native SL failed for {symbol}: {result.get('message', '')}")
-            return
-
-        order_id = result.get("id", "unknown") if isinstance(result, dict) else "unknown"
-        native_sl_orders[symbol] = {"order_id": order_id, "sl_price": sl_price}
-        log.info(f"🛡️ Native SL placed: {symbol} {sl_side.upper()} {qty} @ stop={sl_price} | order={order_id}")
-
-    except Exception as e:
-        log.warning(f"⚠️ Native SL error for {symbol}: {e}")
+    """DISABLED — market_order + stop_price executes immediately on CoinDCX.
+    Need to find correct stop order type before re-enabling."""
+    log.info(f"🛡️ Native SL SKIPPED (disabled): {symbol} @ {sl_price} — needs stop order type fix")
+    return
 
 
 def cancel_native_sl(symbol):
