@@ -218,7 +218,7 @@ def _find_position_id(symbol, max_wait=30, interval=3):
                 positions = resp.json()
                 if isinstance(positions, list):
                     for p in positions:
-                        if p.get("pair") == symbol and abs(float(p.get("active_pos", 0))) > 0.0001:
+                        if p.get("pair") == symbol and abs(float(p.get("quantity", 0))) > 0.0001:
                             return p.get("id")
         except Exception as e:
             log.warning(f"⚠️ Position poll error: {e}")
