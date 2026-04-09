@@ -427,7 +427,7 @@ def stats():
         "time": datetime.now().isoformat()
     })
 
-@app.route("/clear-lock", methods=["POST"])
+@app.route("/clear-lock", methods=["POST", "GET"])
 def clear_lock():
     symbol = request.args.get("symbol")
     if symbol:
