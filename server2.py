@@ -111,6 +111,13 @@ def tick_round_sl(sl_price, entry_price, side, symbol):
 #           order_id, tp_price, sl_price, books_done, leverage, margin_ccy}}
 active_trades = {}
 
+# ─── Entry cooldown safety net ─────────────────────────────
+# Blocks stray `entry` alerts within N seconds of a successful entry/reverse.
+# Independent of active_trades — catches cases where in-memory tracking is
+# somehow lost but Pine still fires a redundant entry webhook.
+last_action_time = {}  # {symbol: epoch_seconds}
+ENTRY_COOLDOWN_SEC = int(os.environ.get("ENTRY_COOLDOWN_SEC", "60"))
+
 FIXED_MARGIN_INR = float(os.environ.get("FIXED_MARGIN_INR", "0"))
 USDT_INR_RATE = float(os.environ.get("USDT_INR_RATE", "98"))
 WALLET_USAGE_PCT = float(os.environ.get("WALLET_USAGE_PCT", "100")) / 100
@@ -216,6 +223,15 @@ def webhook():
 
         # ─── ENTRY — initial position ─────────────────────────
         if alert_type == "entry":
+            # Cooldown safety net — blocks redundant entry alerts within N seconds
+            # of a prior entry/reverse on the same symbol (independent of active_trades).
+            if symbol in last_action_time:
+                elapsed = time.time() - last_action_time[symbol]
+                if elapsed < ENTRY_COOLDOWN_SEC:
+                    log.info(f"🚫 SKIP entry: {symbol} cooldown ({elapsed:.0f}s < {ENTRY_COOLDOWN_SEC}s)")
+                    log_trade_event(symbol, action, "entry", "SKIP", f"cooldown {elapsed:.0f}s")
+                    return jsonify({"status": "skipped", "reason": "cooldown"}), 200
+
             if symbol in active_trades:
                 trade = active_trades[symbol]
                 mins = int((time.time() - trade["entry_time"]) // 60)
@@ -248,6 +264,7 @@ def webhook():
                              tp_price=tp_price, sl_price=sl_price,
                              leverage=leverage, margin_ccy=margin_ccy)
             log_trade_event(symbol, action, "entry", "FILLED", f"TP={tp_price} SL={sl_price}")
+            last_action_time[symbol] = time.time()
 
             # Place native SL on CoinDCX as safety net
             if sl_price:
@@ -357,6 +374,7 @@ def webhook():
                              tp_price=tp_price, sl_price=sl_price,
                              leverage=leverage, margin_ccy=margin_ccy)
             log_trade_event(symbol, action, "reverse_entry", "FILLED", f"TP={tp_price} SL={sl_price}")
+            last_action_time[symbol] = time.time()
 
             if sl_price:
                 place_native_sl(symbol, action, filled_qty, sl_price, leverage, margin_ccy)
