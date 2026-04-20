@@ -3,6 +3,7 @@ import json
 import math
 import time
 import logging
+import threading
 from datetime import datetime, timezone, timedelta
 from flask import Flask, request, jsonify
 from coindcx_client import CoinDCXFutures
@@ -117,6 +118,50 @@ active_trades = {}
 # somehow lost but Pine still fires a redundant entry webhook.
 last_action_time = {}  # {symbol: epoch_seconds}
 ENTRY_COOLDOWN_SEC = int(os.environ.get("ENTRY_COOLDOWN_SEC", "60"))
+
+# ─── Fill Quality Logging ──────────────────────────────────
+# Logs the actual CoinDCX order response after each place_order call.
+# Flags partial fills / non-200 statuses as WARNING so they surface in Railway logs.
+# Does NOT change any existing behavior — purely observational.
+def log_order_response(symbol, side, requested_qty, result, context=""):
+    try:
+        if not isinstance(result, dict):
+            log.warning(f"⚠️ FILL [{context}] {symbol} {side}: non-dict response "
+                        f"type={type(result).__name__} value={str(result)[:200]}")
+            return
+
+        total_qty     = result.get("total_quantity")
+        remaining_qty = result.get("remaining_quantity")
+        filled_qty    = result.get("filled_quantity")
+        status        = result.get("status")
+        avg_price     = result.get("avg_price") or result.get("average_price")
+        order_id      = result.get("id", "?")
+
+        # Derive filled_qty if CoinDCX only gave us total + remaining
+        if filled_qty is None and total_qty is not None and remaining_qty is not None:
+            try:
+                filled_qty = float(total_qty) - float(remaining_qty)
+            except (TypeError, ValueError):
+                pass
+
+        log.info(f"📊 FILL [{context}] {symbol} {side} id={order_id} "
+                 f"req={requested_qty} total={total_qty} filled={filled_qty} "
+                 f"remaining={remaining_qty} status={status} avg={avg_price}")
+
+        # Partial-fill detector (>1% shortfall)
+        try:
+            if filled_qty is not None:
+                f = float(filled_qty)
+                r = float(requested_qty)
+                if r > 0 and (r - f) / r > 0.01:
+                    pct = (f / r * 100) if r > 0 else 0
+                    log.warning(f"⚠️ PARTIAL FILL [{context}] {symbol} {side}: "
+                                f"requested={r} filled={f} ({pct:.1f}%) — "
+                                f"active_trades may now differ from CoinDCX reality")
+        except (TypeError, ValueError):
+            pass
+    except Exception as e:
+        log.error(f"❌ log_order_response crashed for {symbol}: {e}")
 
 FIXED_MARGIN_INR = float(os.environ.get("FIXED_MARGIN_INR", "0"))
 USDT_INR_RATE = float(os.environ.get("USDT_INR_RATE", "98"))
@@ -258,6 +303,8 @@ def webhook():
                 log_trade_event(symbol, action, "entry", "REJECT", err)
                 return jsonify({"status": "rejected", "reason": err}), 200
 
+            log_order_response(symbol, action, quantity, result, context="entry")
+
             order_id = result.get("id", "unknown") if isinstance(result, dict) else "unknown"
             filled_qty = float(result.get("total_quantity", quantity)) if isinstance(result, dict) else quantity
             set_active_trade(symbol, action, filled_qty, coin_price, order_id,
@@ -308,6 +355,8 @@ def webhook():
                     place_native_sl(symbol, trade["side"], trade["qty"], trade["sl_price"], leverage, margin_ccy)
                 return jsonify({"status": "rejected", "reason": err}), 200
 
+            log_order_response(symbol, close_side, book_qty, result, context="book")
+
             # Update tracked qty and TP/SL from Pine
             trade["qty"] -= book_qty
             trade["books_done"] += 1
@@ -344,6 +393,8 @@ def webhook():
                     if isinstance(close_result, dict) and close_result.get("status") == "error":
                         err = close_result.get("message", "")
                         log.warning(f"⚠️ Reverse close failed (likely already closed): {err}")
+                    else:
+                        log_order_response(symbol, close_side, close_qty, close_result, context="reverse-close")
 
                 clear_active_trade(symbol, "reverse — SL hit")
                 log_trade_event(symbol, close_side, "reverse_close", "FILLED", "Pine reverse")
@@ -367,6 +418,8 @@ def webhook():
                 log.error(f"❌ Reverse entry failed: {err}")
                 log_trade_event(symbol, action, "reverse_entry", "REJECT", err)
                 return jsonify({"status": "rejected", "reason": err}), 200
+
+            log_order_response(symbol, action, quantity, result, context="reverse-open")
 
             order_id = result.get("id", "unknown") if isinstance(result, dict) else "unknown"
             filled_qty = float(result.get("total_quantity", quantity)) if isinstance(result, dict) else quantity
@@ -403,6 +456,8 @@ def webhook():
                     )
                     if isinstance(result, dict) and result.get("status") == "error":
                         log.warning(f"⚠️ Kill close may have failed: {result.get('message','')}")
+                    else:
+                        log_order_response(symbol, close_side, close_qty, result, context="kill-close")
 
                 clear_active_trade(symbol, f"kill switch — return {ret_pct}%")
                 log_trade_event(symbol, close_side, "kill", "FILLED", f"return={ret_pct}%")
@@ -466,9 +521,91 @@ def health():
         "time": datetime.now().isoformat()
     })
 
+# ═══════════════════════════════════════════════════════════
+#  PERIODIC POSITION SYNC — passive reconciliation
+#  Pulls CoinDCX positions every N seconds, compares to active_trades,
+#  LOGS mismatches only. Does NOT auto-close or auto-open anything.
+#  Known limitation: CoinDCX positions API returns active_pos=0 for
+#  INR-margin positions, so sync is mostly useful for USDT-margin.
+#  Even so, it surfaces drift when positions do appear.
+# ═══════════════════════════════════════════════════════════
+SYNC_ENABLED      = os.environ.get("SYNC_POSITIONS", "true").lower() == "true"
+SYNC_INTERVAL_SEC = int(os.environ.get("SYNC_INTERVAL_SEC", "60"))
+SYNC_MISMATCH_TOL = float(os.environ.get("SYNC_MISMATCH_TOL", "0.10"))  # 10% tolerance
+
+def sync_positions_worker():
+    log.info(f"🔄 sync_positions thread started (interval={SYNC_INTERVAL_SEC}s, tol={SYNC_MISMATCH_TOL*100:.0f}%)")
+    while True:
+        try:
+            time.sleep(SYNC_INTERVAL_SEC)
+            if not active_trades:
+                continue
+
+            positions = client.get_positions()
+            if not isinstance(positions, list):
+                log.warning(f"⚠️ SYNC: unexpected positions response type={type(positions).__name__}")
+                continue
+
+            # Build {pair: position_dict} from CoinDCX response
+            cdcx_by_pair = {}
+            for p in positions:
+                if isinstance(p, dict) and p.get("pair"):
+                    cdcx_by_pair[p["pair"]] = p
+
+            # Iterate a snapshot to avoid mutation-during-iteration races
+            snapshot = dict(active_trades)
+            for symbol, tracked in snapshot.items():
+                cdcx = cdcx_by_pair.get(symbol)
+                tracked_qty  = float(tracked.get("qty", 0))
+                tracked_side = tracked.get("side", "?")
+
+                if cdcx is None:
+                    log.warning(f"⚠️ SYNC: {symbol} tracked ({tracked_side} {tracked_qty:.4f}) "
+                                f"but NOT in CoinDCX positions response")
+                    continue
+
+                try:
+                    active_pos = float(cdcx.get("active_pos", 0))
+                except (TypeError, ValueError):
+                    active_pos = 0.0
+
+                cdcx_qty  = abs(active_pos)
+                cdcx_side = "buy" if active_pos > 0 else ("sell" if active_pos < 0 else "flat")
+
+                # INR-margin typically returns active_pos=0 — note it but don't spam
+                if cdcx_qty < 1e-6:
+                    log.info(f"🔄 SYNC: {symbol} tracked={tracked_side} {tracked_qty:.4f}, "
+                             f"CoinDCX active_pos=0 (normal for INR-margin)")
+                    continue
+
+                # Side mismatch
+                if cdcx_side != tracked_side:
+                    log.warning(f"⚠️ SYNC SIDE MISMATCH: {symbol} tracked={tracked_side} "
+                                f"but CoinDCX side={cdcx_side} qty={cdcx_qty:.4f}")
+                    continue
+
+                # Qty mismatch beyond tolerance
+                if tracked_qty > 0:
+                    diff_ratio = abs(cdcx_qty - tracked_qty) / tracked_qty
+                    if diff_ratio > SYNC_MISMATCH_TOL:
+                        pct = cdcx_qty / tracked_qty * 100 if tracked_qty > 0 else 0
+                        log.warning(f"⚠️ SYNC QTY MISMATCH: {symbol} tracked={tracked_qty:.4f}, "
+                                    f"CoinDCX={cdcx_qty:.4f} ({pct:.1f}%)")
+        except Exception as e:
+            log.error(f"❌ sync_positions loop error: {e}")
+
+def start_sync_thread():
+    if not SYNC_ENABLED:
+        log.info("🔄 sync_positions DISABLED (set SYNC_POSITIONS=true to enable)")
+        return
+    t = threading.Thread(target=sync_positions_worker, daemon=True, name="sync-positions")
+    t.start()
+
+
 # ─── Startup ──────────────────────────────────────────────────
 load_tick_sizes()
-log.info("🤖 Trail TP/SL Rev Bot ready — Pine-driven bookings + native SL")
+start_sync_thread()
+log.info("🤖 Trail TP/SL Rev Bot ready — Pine-driven bookings + native SL + fill-quality logging + sync")
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
