@@ -3,6 +3,8 @@ import json
 import math
 import time
 import logging
+import threading
+import requests
 from datetime import datetime, timezone, timedelta
 from flask import Flask, request, jsonify
 from coindcx_client import CoinDCXFutures
@@ -111,6 +113,29 @@ def tick_round_sl(sl_price, entry_price, side, symbol):
 #           order_id, tp_price, sl_price, books_done, leverage, margin_ccy}}
 active_trades = {}
 
+# ═══════════════════════════════════════════════════════════
+#  AUTO PROFIT-LOCK — close all positions when net ROE ≥ threshold
+# ═══════════════════════════════════════════════════════════
+# When (sum of unrealized P&L across all active positions) / (sum of
+# deployed margins) ≥ PROFIT_LOCK_PCT, the monitor thread:
+#   1. closes every position in active_trades via market order
+#   2. clears active_trades
+#   3. activates a cooldown window that rejects every webhook except fresh
+#      'entry' alerts, for COOLDOWN_AFTER_LOCK_SEC seconds
+#
+# Math: net% = sum((mark - entry) * qty * dir) / sum(margin) where
+# margin per position is stored on set_active_trade (entry_price * qty / leverage).
+# Polls CoinDCX public ticker endpoint (no auth) every POLL_INTERVAL_SEC.
+PROFIT_LOCK_ENABLED        = os.environ.get("PROFIT_LOCK_ENABLED", "true").lower() == "true"
+PROFIT_LOCK_PCT            = float(os.environ.get("PROFIT_LOCK_PCT", "13.0"))
+POLL_INTERVAL_SEC          = int(os.environ.get("PROFIT_LOCK_POLL_SEC", "10"))
+COOLDOWN_AFTER_LOCK_SEC    = int(os.environ.get("PROFIT_LOCK_COOLDOWN_SEC", "300"))
+TICKER_CACHE_TTL_SEC       = 5  # avoid hammering ticker endpoint
+
+# Shared state (thread-safe via simple GIL semantics — all reads/writes atomic)
+_profit_lock_until = 0.0   # epoch timestamp; webhooks restricted until this
+_ticker_cache = {}          # {symbol: (price, fetched_at)}
+
 FIXED_MARGIN_INR = float(os.environ.get("FIXED_MARGIN_INR", "0"))
 USDT_INR_RATE = float(os.environ.get("USDT_INR_RATE", "98"))
 WALLET_USAGE_PCT = float(os.environ.get("WALLET_USAGE_PCT", "100")) / 100
@@ -118,6 +143,184 @@ WALLET_USAGE_PCT = float(os.environ.get("WALLET_USAGE_PCT", "100")) / 100
 # ─── Event Log ───
 trade_log = []
 MAX_LOG = 50
+
+# ═══════════════════════════════════════════════════════════
+#  PROFIT-LOCK MONITOR
+# ═══════════════════════════════════════════════════════════
+def fetch_mark_price(symbol):
+    """Get current mark price for a futures symbol.
+
+    Strategy (in order):
+      1. CoinDCX public futures endpoint — real-time mark price (mp field).
+         This matches exactly what CoinDCX's UI uses for ROE calculation.
+         Cached for TICKER_CACHE_TTL_SEC to batch calls when many symbols
+         are queried in the same polling cycle.
+      2. Fall back to last_known_price recorded from the most recent webhook
+         (Pine sends `close` on every alert — stale between bar closes but
+         always available).
+      3. Fall back to entry_price so compute_net_roe returns 0% for this
+         symbol rather than crashing.
+    """
+    now = time.time()
+
+    # Primary: cached real-time mark price
+    cached = _ticker_cache.get(symbol)
+    if cached and (now - cached[1]) < TICKER_CACHE_TTL_SEC:
+        return cached[0]
+
+    # Primary: live fetch from public futures endpoint
+    try:
+        resp = _req.get(
+            "https://public.coindcx.com/market_data/v3/current_prices/futures/rt",
+            timeout=5
+        )
+        if resp.status_code == 200:
+            data = resp.json()
+            # Response shape: {"ts":..., "prices": {"B-LIT_USDT": {"mp": ..., "ls": ..., ...}}}
+            prices = data.get("prices") if isinstance(data, dict) else None
+            if isinstance(prices, dict):
+                # Populate cache for all symbols in one shot — saves repeated fetches
+                # when compute_net_roe iterates across multiple active trades
+                for sym, row in prices.items():
+                    if not isinstance(row, dict):
+                        continue
+                    px_raw = row.get("mp") or row.get("ls") or row.get("last_price")
+                    if px_raw is None:
+                        continue
+                    try:
+                        _ticker_cache[sym] = (float(px_raw), now)
+                    except (TypeError, ValueError):
+                        continue
+                # Return this symbol's fresh price if present
+                if symbol in _ticker_cache:
+                    return _ticker_cache[symbol][0]
+    except Exception as e:
+        log.debug(f"ticker fetch failed for {symbol}: {e}")
+
+    # Fallback: webhook-recorded price on the trade itself
+    trade = active_trades.get(symbol)
+    if trade:
+        lkp = trade.get("last_known_price")
+        lkp_time = trade.get("last_known_price_time", 0)
+        if lkp and (time.time() - lkp_time) < 600:
+            return float(lkp)
+        # Last resort: entry price (returns 0% pnl for this symbol)
+        return float(trade.get("entry_price", 0) or 0) or None
+    return None
+
+
+def record_webhook_price(symbol, price):
+    """Called from webhook handler: stores the current price on the active trade
+    as a fallback for when the public endpoint is unavailable."""
+    if symbol in active_trades and price:
+        try:
+            active_trades[symbol]["last_known_price"] = float(price)
+            active_trades[symbol]["last_known_price_time"] = time.time()
+        except (TypeError, ValueError):
+            pass
+
+
+def compute_net_roe():
+    """Return (net_pnl_inr, total_margin_inr, net_pct) across all active trades.
+    Returns (None, None, None) if any price is unavailable."""
+    if not active_trades:
+        return 0.0, 0.0, 0.0
+    total_pnl = 0.0
+    total_margin = 0.0
+    for sym, trade in list(active_trades.items()):
+        mark = fetch_mark_price(sym)
+        if mark is None or mark <= 0:
+            return None, None, None
+        entry = float(trade.get("entry_price", 0) or 0)
+        qty   = float(trade.get("qty", 0) or 0)
+        side  = trade.get("side", "")
+        lev   = int(trade.get("leverage", DEFAULT_LEVERAGE) or DEFAULT_LEVERAGE)
+        if entry <= 0 or qty <= 0:
+            continue
+        direction = 1 if side == "buy" else -1
+        pnl_usd = (mark - entry) * qty * direction
+        pnl_inr = pnl_usd * float(os.environ.get("USDT_INR_RATE", "98"))
+        margin_inr = (entry * qty / lev) * float(os.environ.get("USDT_INR_RATE", "98"))
+        total_pnl += pnl_inr
+        total_margin += margin_inr
+    if total_margin <= 0:
+        return total_pnl, 0.0, 0.0
+    return total_pnl, total_margin, (total_pnl / total_margin) * 100
+
+
+def close_all_positions(trigger_reason="profit lock"):
+    """Close every position in active_trades via market order, clear state,
+    cancel any native SLs, and activate the post-lock cooldown."""
+    global _profit_lock_until
+    snapshot = list(active_trades.items())
+    log.info(f"🔒 PROFIT LOCK triggered ({trigger_reason}) — closing {len(snapshot)} positions")
+    for sym, trade in snapshot:
+        try:
+            close_qty = float(trade.get("qty", 0) or 0)
+            if close_qty <= 0:
+                continue
+            close_side = "sell" if trade.get("side") == "buy" else "buy"
+            lev = trade.get("leverage", DEFAULT_LEVERAGE)
+            mcy = trade.get("margin_ccy", DEFAULT_MARGIN)
+            log.info(f"🔻 LOCK close: {close_side.upper()} {close_qty} {sym}")
+            result = client.place_order(
+                pair=sym, side=close_side, order_type="market_order",
+                total_quantity=close_qty, leverage=lev, margin_currency=mcy
+            )
+            if isinstance(result, dict) and result.get("status") == "error":
+                log.warning(f"⚠️ Lock close failed for {sym}: {result.get('message','')}")
+            log_trade_event(sym, close_side, "profit_lock", "FILLED", trigger_reason)
+        except Exception as e:
+            log.error(f"❌ Lock close exception for {sym}: {e}", exc_info=True)
+    # Cancel native SLs, clear tracking
+    for sym in list(native_sl_orders.keys()):
+        try:
+            cancel_native_sl(sym)
+        except Exception:
+            pass
+    active_trades.clear()
+    _profit_lock_until = time.time() + COOLDOWN_AFTER_LOCK_SEC
+    cooldown_end = datetime.fromtimestamp(_profit_lock_until).strftime("%H:%M:%S")
+    log.info(f"✅ PROFIT LOCK complete — all positions closed, cooldown until {cooldown_end}")
+
+
+def profit_lock_worker():
+    """Background thread: polls net ROE every POLL_INTERVAL_SEC; triggers close-all
+    when threshold crossed. Skips polling during cooldown window."""
+    log.info(f"🎯 Profit-lock monitor started — threshold={PROFIT_LOCK_PCT}%, "
+             f"poll={POLL_INTERVAL_SEC}s, cooldown={COOLDOWN_AFTER_LOCK_SEC}s")
+    while True:
+        try:
+            time.sleep(POLL_INTERVAL_SEC)
+            if not PROFIT_LOCK_ENABLED:
+                continue
+            if time.time() < _profit_lock_until:
+                continue  # in cooldown window
+            if not active_trades:
+                continue
+            pnl, margin, pct = compute_net_roe()
+            if pct is None:
+                log.debug("profit-lock: price fetch unavailable this cycle")
+                continue
+            # Verbose log every cycle so you can see it working in Railway
+            log.info(f"🎯 net_roe check: pnl=₹{pnl:.2f} margin=₹{margin:.2f} "
+                     f"net={pct:.2f}% (threshold={PROFIT_LOCK_PCT}%) "
+                     f"positions={len(active_trades)}")
+            if pct >= PROFIT_LOCK_PCT:
+                close_all_positions(trigger_reason=f"net ROE {pct:.2f}% ≥ {PROFIT_LOCK_PCT}%")
+        except Exception as e:
+            log.error(f"profit-lock worker error: {e}", exc_info=True)
+
+
+def in_profit_lock_cooldown():
+    """Return True if we're currently in the post-lock cooldown window."""
+    return time.time() < _profit_lock_until
+
+
+def cooldown_remaining_sec():
+    remaining = _profit_lock_until - time.time()
+    return max(0, int(remaining))
+
 
 def log_trade_event(symbol, action, alert_type, result, reason=""):
     trade_log.append({
@@ -209,10 +412,24 @@ def webhook():
         sl_price = float(data.get("sl_price", 0)) if data.get("sl_price") else None
         book_pct = float(data.get("book_pct", 33)) / 100
 
+        # Record the freshest price for this symbol — used by profit-lock monitor
+        if symbol and coin_price > 0:
+            record_webhook_price(symbol, coin_price)
+
         if action not in ("buy", "sell"):
             return jsonify({"status": "rejected", "reason": "invalid action"}), 200
         if not symbol:
             return jsonify({"status": "rejected", "reason": "missing symbol"}), 200
+
+        # ─── PROFIT-LOCK COOLDOWN GATE ────────────────────────
+        # After an auto-close-all, reject ALL webhooks (including entries)
+        # for COOLDOWN_AFTER_LOCK_SEC seconds. This lets Pine's internal
+        # state drift back into sync before we accept new trades.
+        if in_profit_lock_cooldown():
+            remaining = cooldown_remaining_sec()
+            log.info(f"🔒 COOLDOWN: rejecting {alert_type} for {symbol} — {remaining}s left")
+            log_trade_event(symbol, action, alert_type, "COOLDOWN", f"{remaining}s remaining")
+            return jsonify({"status": "rejected", "reason": f"profit-lock cooldown ({remaining}s)"}), 200
 
         # ─── ENTRY — initial position ─────────────────────────
         if alert_type == "entry":
@@ -407,12 +624,68 @@ def webhook():
 # ═══════════════════════════════════════════════════════════
 @app.route("/status", methods=["GET"])
 def status():
+    pnl, margin, pct = compute_net_roe()
+    pct_str = f"{pct:.2f}" if pct is not None else "unavailable"
     return jsonify({
         "active_trades": active_trades,
         "native_sl_orders": native_sl_orders,
         "positions": len(active_trades),
+        "profit_lock": {
+            "enabled": PROFIT_LOCK_ENABLED,
+            "threshold_pct": PROFIT_LOCK_PCT,
+            "current_net_pct": pct_str,
+            "net_pnl_inr": round(pnl, 2) if pnl is not None else None,
+            "total_margin_inr": round(margin, 2) if margin is not None else None,
+            "in_cooldown": in_profit_lock_cooldown(),
+            "cooldown_remaining_sec": cooldown_remaining_sec(),
+        },
         "time": datetime.now().isoformat()
     })
+
+@app.route("/profit-lock/check", methods=["GET"])
+def profit_lock_check():
+    """Force a manual profit-lock check; does NOT trigger close unless threshold met."""
+    pnl, margin, pct = compute_net_roe()
+    # Per-symbol price diagnostics
+    price_sources = {}
+    now = time.time()
+    for sym, trade in active_trades.items():
+        lkp = trade.get("last_known_price")
+        lkp_time = trade.get("last_known_price_time", 0)
+        age = int(now - lkp_time) if lkp_time else None
+        cached = _ticker_cache.get(sym)
+        price_sources[sym] = {
+            "webhook_price": lkp,
+            "webhook_price_age_sec": age,
+            "public_endpoint_cache": cached[0] if cached else None,
+            "using": (
+                "webhook" if (lkp and age is not None and age < 600)
+                else ("public_endpoint" if cached else "none/fallback_to_entry")
+            ),
+        }
+    return jsonify({
+        "net_pnl_inr": pnl,
+        "total_margin_inr": margin,
+        "net_pct": pct,
+        "threshold_pct": PROFIT_LOCK_PCT,
+        "would_trigger": (pct is not None and pct >= PROFIT_LOCK_PCT),
+        "in_cooldown": in_profit_lock_cooldown(),
+        "cooldown_remaining_sec": cooldown_remaining_sec(),
+        "price_sources": price_sources,
+    })
+
+@app.route("/profit-lock/force", methods=["POST", "GET"])
+def profit_lock_force():
+    """Manually trigger close-all-and-lock (for emergencies / testing).
+    Requires ?secret=... matching WEBHOOK_SECRET."""
+    if WEBHOOK_SECRET and request.args.get("secret") != WEBHOOK_SECRET:
+        return jsonify({"error": "unauthorized"}), 401
+    if not active_trades:
+        return jsonify({"status": "no_positions", "active": 0})
+    count = len(active_trades)
+    close_all_positions(trigger_reason="manual force")
+    return jsonify({"status": "locked", "closed": count,
+                    "cooldown_remaining_sec": cooldown_remaining_sec()})
 
 @app.route("/stats", methods=["GET"])
 def stats():
@@ -451,6 +724,11 @@ def health():
 # ─── Startup ──────────────────────────────────────────────────
 load_tick_sizes()
 log.info("🤖 Trail TP/SL Rev Bot ready — Pine-driven bookings + native SL")
+
+# Start the profit-lock monitor thread (unconditional — it self-gates on the
+# PROFIT_LOCK_ENABLED env var so you can flip it without a redeploy).
+_profit_lock_thread = threading.Thread(target=profit_lock_worker, daemon=True)
+_profit_lock_thread.start()
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
