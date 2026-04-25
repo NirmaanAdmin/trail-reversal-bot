@@ -136,6 +136,30 @@ TICKER_CACHE_TTL_SEC       = 5  # avoid hammering ticker endpoint
 _profit_lock_until = 0.0   # epoch timestamp; webhooks restricted until this
 _ticker_cache = {}          # {symbol: (price, fetched_at)}
 
+# ═══════════════════════════════════════════════════════════
+#  DAILY PROFIT CAP — hard stop after N% cumulative locked
+# ═══════════════════════════════════════════════════════════
+# Tracks cumulative profit-lock %s captured across the day. When the sum
+# reaches DAILY_CAP_PCT (default 26%), the server enters a hard-pause state:
+# every webhook (entry, book, reverse, kill) is rejected until either:
+#   (a) midnight IST passes — counter auto-resets, pause lifts
+#   (b) operator hits POST /daily-cap/reset?secret=... to manually unpause
+#
+# Each profit-lock event contributes its triggering net% to the running sum.
+# Example: lock #1 fires at 13.5%, lock #2 fires at 14.2% → cumulative 27.7%
+# → daily cap exceeded → pause until midnight IST.
+DAILY_CAP_ENABLED          = os.environ.get("DAILY_CAP_ENABLED", "true").lower() == "true"
+DAILY_CAP_PCT              = float(os.environ.get("DAILY_CAP_PCT", "26.0"))
+
+# Shared state — reset at midnight IST
+_daily_locked_pct_sum      = 0.0   # cumulative net% from all locks today
+_daily_lock_count          = 0     # number of locks fired today
+_daily_paused              = False # True once cap is hit (until midnight or manual reset)
+_daily_counter_date        = None  # tracks which IST date the counter belongs to
+
+# IST timezone constant for date comparisons
+IST_TZ = timezone(timedelta(hours=5, minutes=30))
+
 FIXED_MARGIN_INR = float(os.environ.get("FIXED_MARGIN_INR", "0"))
 USDT_INR_RATE = float(os.environ.get("USDT_INR_RATE", "98"))
 WALLET_USAGE_PCT = float(os.environ.get("WALLET_USAGE_PCT", "100")) / 100
@@ -248,9 +272,55 @@ def compute_net_roe():
     return total_pnl, total_margin, (total_pnl / total_margin) * 100
 
 
-def close_all_positions(trigger_reason="profit lock"):
+# ─── DAILY CAP HELPERS ─────────────────────────────────────
+def _current_ist_date():
+    """Return today's date in IST as a date object."""
+    return datetime.now(IST_TZ).date()
+
+
+def _check_and_reset_daily_counter():
+    """If we've crossed midnight IST since the counter was last set, reset.
+    Called at the top of every webhook + every monitor cycle."""
+    global _daily_locked_pct_sum, _daily_lock_count, _daily_paused, _daily_counter_date
+    today = _current_ist_date()
+    if _daily_counter_date != today:
+        if _daily_counter_date is not None:
+            log.info(f"🌅 IST midnight crossed — resetting daily counter "
+                     f"(previous day: locks={_daily_lock_count}, "
+                     f"sum={_daily_locked_pct_sum:.2f}%, paused={_daily_paused})")
+        _daily_locked_pct_sum = 0.0
+        _daily_lock_count = 0
+        _daily_paused = False
+        _daily_counter_date = today
+
+
+def _bump_daily_counter(lock_pct):
+    """Called inside close_all_positions when a lock fires.
+    Adds the triggering net% to the cumulative sum and trips the daily pause
+    if the cap is exceeded."""
+    global _daily_locked_pct_sum, _daily_lock_count, _daily_paused
+    _check_and_reset_daily_counter()
+    _daily_locked_pct_sum += lock_pct
+    _daily_lock_count += 1
+    log.info(f"📊 Daily progress: lock #{_daily_lock_count} added {lock_pct:.2f}% "
+             f"→ cumulative {_daily_locked_pct_sum:.2f}% / cap {DAILY_CAP_PCT}%")
+    if DAILY_CAP_ENABLED and _daily_locked_pct_sum >= DAILY_CAP_PCT and not _daily_paused:
+        _daily_paused = True
+        log.warning(f"🛑 DAILY CAP REACHED — cumulative {_daily_locked_pct_sum:.2f}% "
+                    f"≥ {DAILY_CAP_PCT}% — ALL webhooks paused until IST midnight "
+                    f"or manual /daily-cap/reset")
+
+
+def daily_cap_active():
+    """Returns True if daily cap is hit and webhooks should be rejected."""
+    _check_and_reset_daily_counter()
+    return DAILY_CAP_ENABLED and _daily_paused
+
+
+def close_all_positions(trigger_reason="profit lock", trigger_pct=None):
     """Close every position in active_trades via market order, clear state,
-    cancel any native SLs, and activate the post-lock cooldown."""
+    cancel any native SLs, and activate the post-lock cooldown.
+    If trigger_pct is provided, also bumps the daily cumulative counter."""
     global _profit_lock_until
     snapshot = list(active_trades.items())
     log.info(f"🔒 PROFIT LOCK triggered ({trigger_reason}) — closing {len(snapshot)} positions")
@@ -282,6 +352,9 @@ def close_all_positions(trigger_reason="profit lock"):
     _profit_lock_until = time.time() + COOLDOWN_AFTER_LOCK_SEC
     cooldown_end = datetime.fromtimestamp(_profit_lock_until).strftime("%H:%M:%S")
     log.info(f"✅ PROFIT LOCK complete — all positions closed, cooldown until {cooldown_end}")
+    # Bump daily counter (may trip the daily cap)
+    if trigger_pct is not None:
+        _bump_daily_counter(trigger_pct)
 
 
 def profit_lock_worker():
@@ -307,7 +380,10 @@ def profit_lock_worker():
                      f"net={pct:.2f}% (threshold={PROFIT_LOCK_PCT}%) "
                      f"positions={len(active_trades)}")
             if pct >= PROFIT_LOCK_PCT:
-                close_all_positions(trigger_reason=f"net ROE {pct:.2f}% ≥ {PROFIT_LOCK_PCT}%")
+                close_all_positions(
+                    trigger_reason=f"net ROE {pct:.2f}% ≥ {PROFIT_LOCK_PCT}%",
+                    trigger_pct=pct
+                )
         except Exception as e:
             log.error(f"profit-lock worker error: {e}", exc_info=True)
 
@@ -420,6 +496,20 @@ def webhook():
             return jsonify({"status": "rejected", "reason": "invalid action"}), 200
         if not symbol:
             return jsonify({"status": "rejected", "reason": "missing symbol"}), 200
+
+        # ─── DAILY CAP HARD-STOP GATE ─────────────────────────
+        # If today's cumulative locked profit ≥ DAILY_CAP_PCT, reject EVERY
+        # webhook (entry/book/reverse/kill) regardless of type. State persists
+        # until IST midnight rollover OR manual /daily-cap/reset.
+        if daily_cap_active():
+            log.info(f"🛑 DAILY CAP: rejecting {alert_type} for {symbol} "
+                     f"(cumulative {_daily_locked_pct_sum:.2f}% / cap {DAILY_CAP_PCT}%)")
+            log_trade_event(symbol, action, alert_type, "DAILY_CAP",
+                            f"sum={_daily_locked_pct_sum:.2f}%")
+            return jsonify({
+                "status": "rejected",
+                "reason": f"daily cap reached ({_daily_locked_pct_sum:.2f}% ≥ {DAILY_CAP_PCT}%)"
+            }), 200
 
         # ─── PROFIT-LOCK COOLDOWN GATE ────────────────────────
         # After an auto-close-all, reject ALL webhooks (including entries)
@@ -626,6 +716,7 @@ def webhook():
 def status():
     pnl, margin, pct = compute_net_roe()
     pct_str = f"{pct:.2f}" if pct is not None else "unavailable"
+    _check_and_reset_daily_counter()  # ensure counter reflects current IST date
     return jsonify({
         "active_trades": active_trades,
         "native_sl_orders": native_sl_orders,
@@ -638,6 +729,15 @@ def status():
             "total_margin_inr": round(margin, 2) if margin is not None else None,
             "in_cooldown": in_profit_lock_cooldown(),
             "cooldown_remaining_sec": cooldown_remaining_sec(),
+        },
+        "daily_cap": {
+            "enabled": DAILY_CAP_ENABLED,
+            "cap_pct": DAILY_CAP_PCT,
+            "cumulative_locked_pct": round(_daily_locked_pct_sum, 2),
+            "lock_count_today": _daily_lock_count,
+            "is_paused": _daily_paused,
+            "ist_date": str(_daily_counter_date) if _daily_counter_date else None,
+            "ist_now": datetime.now(IST_TZ).isoformat(),
         },
         "time": datetime.now().isoformat()
     })
@@ -677,15 +777,72 @@ def profit_lock_check():
 @app.route("/profit-lock/force", methods=["POST", "GET"])
 def profit_lock_force():
     """Manually trigger close-all-and-lock (for emergencies / testing).
-    Requires ?secret=... matching WEBHOOK_SECRET."""
+    Requires ?secret=... matching WEBHOOK_SECRET.
+    Computes current net% and contributes it to the daily cap counter."""
     if WEBHOOK_SECRET and request.args.get("secret") != WEBHOOK_SECRET:
         return jsonify({"error": "unauthorized"}), 401
     if not active_trades:
         return jsonify({"status": "no_positions", "active": 0})
     count = len(active_trades)
-    close_all_positions(trigger_reason="manual force")
+    pnl, margin, pct = compute_net_roe()
+    # If net% can't be computed, default to 0 — manual force shouldn't trip cap
+    close_all_positions(
+        trigger_reason="manual force",
+        trigger_pct=(pct if pct is not None else 0.0)
+    )
     return jsonify({"status": "locked", "closed": count,
-                    "cooldown_remaining_sec": cooldown_remaining_sec()})
+                    "trigger_pct": pct,
+                    "cooldown_remaining_sec": cooldown_remaining_sec(),
+                    "daily_cumulative_pct": _daily_locked_pct_sum,
+                    "daily_paused": _daily_paused})
+
+@app.route("/daily-cap/reset", methods=["POST", "GET"])
+def daily_cap_reset():
+    """Manually unpause the daily cap and reset the cumulative counter to 0.
+    Useful when you want to start a new cycle without waiting for IST midnight.
+    Requires ?secret=... matching WEBHOOK_SECRET.
+    Does NOT clear active_trades or affect the profit-lock cooldown."""
+    global _daily_locked_pct_sum, _daily_lock_count, _daily_paused, _daily_counter_date
+    if WEBHOOK_SECRET and request.args.get("secret") != WEBHOOK_SECRET:
+        return jsonify({"error": "unauthorized"}), 401
+    prev_sum = _daily_locked_pct_sum
+    prev_count = _daily_lock_count
+    prev_paused = _daily_paused
+    _daily_locked_pct_sum = 0.0
+    _daily_lock_count = 0
+    _daily_paused = False
+    _daily_counter_date = _current_ist_date()
+    log.info(f"🔄 Daily cap manually reset by operator "
+             f"(was: locks={prev_count}, sum={prev_sum:.2f}%, paused={prev_paused})")
+    return jsonify({
+        "status": "reset",
+        "previous": {
+            "lock_count": prev_count,
+            "cumulative_pct": round(prev_sum, 2),
+            "was_paused": prev_paused,
+        },
+        "current": {
+            "lock_count": 0,
+            "cumulative_pct": 0.0,
+            "is_paused": False,
+            "ist_date": str(_daily_counter_date),
+        }
+    })
+
+@app.route("/daily-cap/check", methods=["GET"])
+def daily_cap_check():
+    """Read-only view of daily cap state."""
+    _check_and_reset_daily_counter()
+    return jsonify({
+        "enabled": DAILY_CAP_ENABLED,
+        "cap_pct": DAILY_CAP_PCT,
+        "cumulative_locked_pct": round(_daily_locked_pct_sum, 2),
+        "remaining_pct": round(max(0, DAILY_CAP_PCT - _daily_locked_pct_sum), 2),
+        "lock_count_today": _daily_lock_count,
+        "is_paused": _daily_paused,
+        "ist_date": str(_daily_counter_date) if _daily_counter_date else None,
+        "ist_now": datetime.now(IST_TZ).isoformat(),
+    })
 
 @app.route("/stats", methods=["GET"])
 def stats():
@@ -724,6 +881,11 @@ def health():
 # ─── Startup ──────────────────────────────────────────────────
 load_tick_sizes()
 log.info("🤖 Trail TP/SL Rev Bot ready — Pine-driven bookings + native SL")
+
+# Initialize daily-cap counter for today's IST date
+_check_and_reset_daily_counter()
+log.info(f"📅 Daily cap initialized — IST date {_daily_counter_date}, "
+         f"cap={DAILY_CAP_PCT}%, enabled={DAILY_CAP_ENABLED}")
 
 # Start the profit-lock monitor thread (unconditional — it self-gates on the
 # PROFIT_LOCK_ENABLED env var so you can flip it without a redeploy).
