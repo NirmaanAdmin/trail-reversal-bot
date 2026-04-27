@@ -18,12 +18,7 @@ class CoinDCXFutures:
         body["timestamp"] = int(round(time.time() * 1000))
         json_body = json.dumps(body, separators=(",", ":"))
         sig = hmac.new(self.api_secret.encode(), json_body.encode(), hashlib.sha256).hexdigest()
-        headers = {
-            "Content-Type": "application/json",
-            "X-AUTH-APIKEY": self.api_key,
-            "X-AUTH-SIGNATURE": sig,
-            "User-Agent": "Mozilla/5.0 (compatible; trail-bot/1.0)",
-        }
+        headers = {"Content-Type": "application/json", "X-AUTH-APIKEY": self.api_key, "X-AUTH-SIGNATURE": sig}
         url = f"{BASE_URL}{endpoint}"
         try:
             resp = self.session.post(url, data=json_body, headers=headers, timeout=15)
@@ -104,22 +99,6 @@ class CoinDCXFutures:
 
     def get_positions(self):
         return self._sign_and_post("/exchange/v1/derivatives/futures/positions", {})
-
-    def get_inr_balance(self):
-        """Return current free INR balance from spot wallet (₹).
-        Returns None on any error so caller can skip the cycle gracefully."""
-        result = self._sign_and_post("/exchange/v1/users/balances", {})
-        if not isinstance(result, list):
-            log.warning(f"get_inr_balance: unexpected response shape: {str(result)[:200]}")
-            return None
-        for row in result:
-            if isinstance(row, dict) and row.get("currency") == "INR":
-                try:
-                    return float(row.get("balance", 0) or 0)
-                except (TypeError, ValueError):
-                    return None
-        log.warning("get_inr_balance: no INR row found in balances response")
-        return None
 
     def cancel_all_orders(self):
         return self._sign_and_post("/exchange/v1/derivatives/futures/cancel_all_orders", {})

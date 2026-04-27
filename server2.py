@@ -114,37 +114,50 @@ def tick_round_sl(sl_price, entry_price, side, symbol):
 active_trades = {}
 
 # ═══════════════════════════════════════════════════════════
-#  DAILY EQUITY TARGET — single threshold, snapshot-vs-current
+#  AUTO PROFIT-LOCK — close all positions when net ROE ≥ threshold
 # ═══════════════════════════════════════════════════════════
-# At 00:01 IST each day (or on first boot if fresh state), the server snapshots
-# total equity = INR wallet balance + sum of position margins + sum of unrealized
-# PnL across all active positions. Background thread polls every TARGET_POLL_SEC
-# and recomputes current equity. If current ≥ baseline × (1 + DAILY_TARGET_PCT/100),
-# the server:
-#   1. force-closes every position in active_trades via market order
+# When (sum of unrealized P&L across all active positions) / (sum of
+# deployed margins) ≥ PROFIT_LOCK_PCT, the monitor thread:
+#   1. closes every position in active_trades via market order
 #   2. clears active_trades
-#   3. enters a hard-paused state — rejects every webhook (entry/book/reverse/kill)
-#   4. stays paused until either:
-#      (a) IST midnight rollover → fresh snapshot taken at 00:01 → pause lifts
-#      (b) operator hits /daily-target/reset?secret=... to manually rebaseline
+#   3. activates a cooldown window that rejects every webhook except fresh
+#      'entry' alerts, for COOLDOWN_AFTER_LOCK_SEC seconds
 #
-# This replaces the older two-tier system (per-cycle 13% lock + cumulative 26% cap).
-DAILY_TARGET_ENABLED       = os.environ.get("DAILY_TARGET_ENABLED", "true").lower() == "true"
-DAILY_TARGET_PCT           = float(os.environ.get("DAILY_TARGET_PCT", "30.0"))
-TARGET_POLL_SEC            = int(os.environ.get("DAILY_TARGET_POLL_SEC", "30"))
-TICKER_CACHE_TTL_SEC       = 5
+# Math: net% = sum((mark - entry) * qty * dir) / sum(margin) where
+# margin per position is stored on set_active_trade (entry_price * qty / leverage).
+# Polls CoinDCX public ticker endpoint (no auth) every POLL_INTERVAL_SEC.
+PROFIT_LOCK_ENABLED        = os.environ.get("PROFIT_LOCK_ENABLED", "true").lower() == "true"
+PROFIT_LOCK_PCT            = float(os.environ.get("PROFIT_LOCK_PCT", "13.0"))
+POLL_INTERVAL_SEC          = int(os.environ.get("PROFIT_LOCK_POLL_SEC", "10"))
+COOLDOWN_AFTER_LOCK_SEC    = int(os.environ.get("PROFIT_LOCK_COOLDOWN_SEC", "300"))
+TICKER_CACHE_TTL_SEC       = 5  # avoid hammering ticker endpoint
 
-# Shared state — reset at IST midnight or on manual /daily-target/reset
-_daily_baseline_equity     = None    # ₹ snapshot taken at 00:01 IST
-_daily_baseline_date       = None    # IST date the baseline belongs to
-_daily_baseline_taken_at   = None    # ISO timestamp the snapshot was taken
-_daily_paused              = False   # True once target hit; reset at midnight/manual
-_daily_target_hit_at       = None    # ISO timestamp of trigger (for status display)
-_daily_target_hit_equity   = None    # ₹ equity at trigger moment
-_ticker_cache              = {}      # {symbol: (price, fetched_at)}
-_inr_balance_cache         = (None, 0)  # (balance, fetched_at) — 30s TTL
+# Shared state (thread-safe via simple GIL semantics — all reads/writes atomic)
+_profit_lock_until = 0.0   # epoch timestamp; webhooks restricted until this
+_ticker_cache = {}          # {symbol: (price, fetched_at)}
 
-# IST timezone for date math
+# ═══════════════════════════════════════════════════════════
+#  DAILY PROFIT CAP — hard stop after N% cumulative locked
+# ═══════════════════════════════════════════════════════════
+# Tracks cumulative profit-lock %s captured across the day. When the sum
+# reaches DAILY_CAP_PCT (default 26%), the server enters a hard-pause state:
+# every webhook (entry, book, reverse, kill) is rejected until either:
+#   (a) midnight IST passes — counter auto-resets, pause lifts
+#   (b) operator hits POST /daily-cap/reset?secret=... to manually unpause
+#
+# Each profit-lock event contributes its triggering net% to the running sum.
+# Example: lock #1 fires at 13.5%, lock #2 fires at 14.2% → cumulative 27.7%
+# → daily cap exceeded → pause until midnight IST.
+DAILY_CAP_ENABLED          = os.environ.get("DAILY_CAP_ENABLED", "true").lower() == "true"
+DAILY_CAP_PCT              = float(os.environ.get("DAILY_CAP_PCT", "26.0"))
+
+# Shared state — reset at midnight IST
+_daily_locked_pct_sum      = 0.0   # cumulative net% from all locks today
+_daily_lock_count          = 0     # number of locks fired today
+_daily_paused              = False # True once cap is hit (until midnight or manual reset)
+_daily_counter_date        = None  # tracks which IST date the counter belongs to
+
+# IST timezone constant for date comparisons
 IST_TZ = timezone(timedelta(hours=5, minutes=30))
 
 FIXED_MARGIN_INR = float(os.environ.get("FIXED_MARGIN_INR", "0"))
@@ -259,97 +272,58 @@ def compute_net_roe():
     return total_pnl, total_margin, (total_pnl / total_margin) * 100
 
 
-# ─── DAILY TARGET HELPERS ──────────────────────────────────
+# ─── DAILY CAP HELPERS ─────────────────────────────────────
 def _current_ist_date():
     """Return today's date in IST as a date object."""
     return datetime.now(IST_TZ).date()
 
 
-def _is_after_snapshot_time(now_ist=None):
-    """True if current IST time is at or past 00:01 (snapshot trigger time)."""
-    now_ist = now_ist or datetime.now(IST_TZ)
-    return now_ist.hour > 0 or (now_ist.hour == 0 and now_ist.minute >= 1)
+def _check_and_reset_daily_counter():
+    """If we've crossed midnight IST since the counter was last set, reset.
+    Called at the top of every webhook + every monitor cycle."""
+    global _daily_locked_pct_sum, _daily_lock_count, _daily_paused, _daily_counter_date
+    today = _current_ist_date()
+    if _daily_counter_date != today:
+        if _daily_counter_date is not None:
+            log.info(f"🌅 IST midnight crossed — resetting daily counter "
+                     f"(previous day: locks={_daily_lock_count}, "
+                     f"sum={_daily_locked_pct_sum:.2f}%, paused={_daily_paused})")
+        _daily_locked_pct_sum = 0.0
+        _daily_lock_count = 0
+        _daily_paused = False
+        _daily_counter_date = today
 
 
-def fetch_inr_balance(force=False):
-    """Get free INR balance from CoinDCX. Cached for 30s to avoid hammering.
-    Returns None if API fails (caller should skip the cycle)."""
-    global _inr_balance_cache
-    now = time.time()
-    cached_val, cached_at = _inr_balance_cache
-    if not force and cached_val is not None and (now - cached_at) < 30:
-        return cached_val
-    try:
-        bal = client.get_inr_balance()
-        if bal is not None:
-            _inr_balance_cache = (bal, now)
-            return bal
-    except Exception as e:
-        log.error(f"fetch_inr_balance error: {e}")
-    return None
+def _bump_daily_counter(lock_pct):
+    """Called inside close_all_positions when a lock fires.
+    Adds the triggering net% to the cumulative sum and trips the daily pause
+    if the cap is exceeded."""
+    global _daily_locked_pct_sum, _daily_lock_count, _daily_paused
+    _check_and_reset_daily_counter()
+    _daily_locked_pct_sum += lock_pct
+    _daily_lock_count += 1
+    log.info(f"📊 Daily progress: lock #{_daily_lock_count} added {lock_pct:.2f}% "
+             f"→ cumulative {_daily_locked_pct_sum:.2f}% / cap {DAILY_CAP_PCT}%")
+    if DAILY_CAP_ENABLED and _daily_locked_pct_sum >= DAILY_CAP_PCT and not _daily_paused:
+        _daily_paused = True
+        log.warning(f"🛑 DAILY CAP REACHED — cumulative {_daily_locked_pct_sum:.2f}% "
+                    f"≥ {DAILY_CAP_PCT}% — ALL webhooks paused until IST midnight "
+                    f"or manual /daily-cap/reset")
 
 
-def compute_current_equity():
-    """Total trading capital RIGHT NOW = free INR + locked margin + unrealized PnL.
-    All values in ₹. Returns (equity, breakdown_dict) or (None, None) if any
-    component fails to compute (caller should skip the cycle)."""
-    inr_bal = fetch_inr_balance()
-    if inr_bal is None:
-        return None, None
-    pnl_inr, margin_inr, pct = compute_net_roe()
-    if pnl_inr is None:
-        # No active positions OR price fetch failed. If active_trades is empty,
-        # equity = just the wallet balance. Otherwise we can't compute, skip.
-        if not active_trades:
-            return inr_bal, {
-                "inr_balance": round(inr_bal, 2),
-                "locked_margin": 0.0,
-                "unrealized_pnl": 0.0,
-                "total": round(inr_bal, 2),
-            }
-        return None, None
-    equity = inr_bal + margin_inr + pnl_inr
-    return equity, {
-        "inr_balance": round(inr_bal, 2),
-        "locked_margin": round(margin_inr, 2),
-        "unrealized_pnl": round(pnl_inr, 2),
-        "total": round(equity, 2),
-    }
+def daily_cap_active():
+    """Returns True if daily cap is hit and webhooks should be rejected."""
+    _check_and_reset_daily_counter()
+    return DAILY_CAP_ENABLED and _daily_paused
 
 
-def take_daily_snapshot(reason="auto"):
-    """Compute current equity and store as the new baseline.
-    Resets paused state. Idempotent — safe to call multiple times."""
-    global _daily_baseline_equity, _daily_baseline_date, _daily_baseline_taken_at
-    global _daily_paused, _daily_target_hit_at, _daily_target_hit_equity
-    equity, breakdown = compute_current_equity()
-    if equity is None:
-        log.warning(f"⚠️ Snapshot failed ({reason}): equity unavailable, will retry next cycle")
-        return False
-    _daily_baseline_equity = equity
-    _daily_baseline_date = _current_ist_date()
-    _daily_baseline_taken_at = datetime.now(IST_TZ).isoformat()
-    _daily_paused = False
-    _daily_target_hit_at = None
-    _daily_target_hit_equity = None
-    target_equity = equity * (1 + DAILY_TARGET_PCT / 100)
-    log.info(f"📸 SNAPSHOT taken ({reason}): baseline=₹{equity:.2f} "
-             f"[free=₹{breakdown['inr_balance']} + margin=₹{breakdown['locked_margin']} "
-             f"+ pnl=₹{breakdown['unrealized_pnl']}] → target=₹{target_equity:.2f} "
-             f"({DAILY_TARGET_PCT}%)")
-    return True
-
-
-def daily_target_paused():
-    """Returns True if daily target is hit and webhooks should be rejected."""
-    return DAILY_TARGET_ENABLED and _daily_paused
-
-
-def close_all_positions(trigger_reason="manual"):
+def close_all_positions(trigger_reason="profit lock", trigger_pct=None):
     """Close every position in active_trades via market order, clear state,
-    cancel any native SLs. Used by daily-target trigger and manual force."""
+    cancel any native SLs, and activate the post-lock cooldown.
+    If trigger_pct is provided, also bumps the daily cumulative counter."""
+    global _profit_lock_until
     snapshot = list(active_trades.items())
-    log.info(f"🔒 CLOSE-ALL triggered ({trigger_reason}) — closing {len(snapshot)} positions")
+    log.info(f"🔒 PROFIT LOCK triggered ({trigger_reason}) — closing {len(snapshot)} positions")
     for sym, trade in snapshot:
         try:
             close_qty = float(trade.get("qty", 0) or 0)
@@ -358,85 +332,70 @@ def close_all_positions(trigger_reason="manual"):
             close_side = "sell" if trade.get("side") == "buy" else "buy"
             lev = trade.get("leverage", DEFAULT_LEVERAGE)
             mcy = trade.get("margin_ccy", DEFAULT_MARGIN)
-            log.info(f"🔻 CLOSE: {close_side.upper()} {close_qty} {sym}")
+            log.info(f"🔻 LOCK close: {close_side.upper()} {close_qty} {sym}")
             result = client.place_order(
                 pair=sym, side=close_side, order_type="market_order",
                 total_quantity=close_qty, leverage=lev, margin_currency=mcy
             )
             if isinstance(result, dict) and result.get("status") == "error":
-                log.warning(f"⚠️ Close failed for {sym}: {result.get('message','')}")
-            log_trade_event(sym, close_side, "close_all", "FILLED", trigger_reason)
+                log.warning(f"⚠️ Lock close failed for {sym}: {result.get('message','')}")
+            log_trade_event(sym, close_side, "profit_lock", "FILLED", trigger_reason)
         except Exception as e:
-            log.error(f"❌ Close exception for {sym}: {e}", exc_info=True)
+            log.error(f"❌ Lock close exception for {sym}: {e}", exc_info=True)
+    # Cancel native SLs, clear tracking
     for sym in list(native_sl_orders.keys()):
         try:
             cancel_native_sl(sym)
         except Exception:
             pass
     active_trades.clear()
-    log.info(f"✅ CLOSE-ALL complete — all positions closed")
+    _profit_lock_until = time.time() + COOLDOWN_AFTER_LOCK_SEC
+    cooldown_end = datetime.fromtimestamp(_profit_lock_until).strftime("%H:%M:%S")
+    log.info(f"✅ PROFIT LOCK complete — all positions closed, cooldown until {cooldown_end}")
+    # Bump daily counter (may trip the daily cap)
+    if trigger_pct is not None:
+        _bump_daily_counter(trigger_pct)
 
 
-def daily_target_worker():
-    """Background thread: every TARGET_POLL_SEC, runs three operations:
-      1. Check IST date — if rolled over past 00:01, take fresh snapshot
-      2. Compute current equity
-      3. If equity ≥ baseline × (1 + DAILY_TARGET_PCT/100): trigger close-all + pause
-    """
-    global _daily_paused, _daily_target_hit_at, _daily_target_hit_equity
-    log.info(f"🎯 Daily-target monitor started — target={DAILY_TARGET_PCT}%, "
-             f"poll={TARGET_POLL_SEC}s")
+def profit_lock_worker():
+    """Background thread: polls net ROE every POLL_INTERVAL_SEC; triggers close-all
+    when threshold crossed. Skips polling during cooldown window."""
+    log.info(f"🎯 Profit-lock monitor started — threshold={PROFIT_LOCK_PCT}%, "
+             f"poll={POLL_INTERVAL_SEC}s, cooldown={COOLDOWN_AFTER_LOCK_SEC}s")
     while True:
         try:
-            time.sleep(TARGET_POLL_SEC)
-            if not DAILY_TARGET_ENABLED:
+            time.sleep(POLL_INTERVAL_SEC)
+            if not PROFIT_LOCK_ENABLED:
                 continue
-
-            # --- Date rollover handling ---
-            today = _current_ist_date()
-            if _daily_baseline_date != today and _is_after_snapshot_time():
-                # Either first run after midnight IST, or first run ever.
-                if _daily_baseline_date is not None:
-                    log.info(f"🌅 IST midnight crossed — taking fresh snapshot "
-                             f"(previous day: baseline=₹{_daily_baseline_equity:.2f}, "
-                             f"paused_at_eod={_daily_paused})")
-                take_daily_snapshot(reason="midnight rollover" if _daily_baseline_date else "first boot")
-
-            # --- Skip if no baseline yet (e.g. before 00:01 on first boot, or snapshot failed) ---
-            if _daily_baseline_equity is None:
+            if time.time() < _profit_lock_until:
+                continue  # in cooldown window
+            if not active_trades:
                 continue
-
-            # --- Skip if already paused (waiting for midnight or manual reset) ---
-            if _daily_paused:
+            pnl, margin, pct = compute_net_roe()
+            if pct is None:
+                log.debug("profit-lock: price fetch unavailable this cycle")
                 continue
-
-            # --- Compute current equity ---
-            equity, breakdown = compute_current_equity()
-            if equity is None:
-                log.debug("daily-target: equity computation unavailable this cycle")
-                continue
-
-            target_equity = _daily_baseline_equity * (1 + DAILY_TARGET_PCT / 100)
-            gain_inr = equity - _daily_baseline_equity
-            gain_pct = (gain_inr / _daily_baseline_equity) * 100 if _daily_baseline_equity > 0 else 0
-
-            log.info(f"🎯 equity check: current=₹{equity:.2f} baseline=₹{_daily_baseline_equity:.2f} "
-                     f"gain=₹{gain_inr:.2f} ({gain_pct:+.2f}%) target={DAILY_TARGET_PCT}% "
+            # Verbose log every cycle so you can see it working in Railway
+            log.info(f"🎯 net_roe check: pnl=₹{pnl:.2f} margin=₹{margin:.2f} "
+                     f"net={pct:.2f}% (threshold={PROFIT_LOCK_PCT}%) "
                      f"positions={len(active_trades)}")
-
-            if equity >= target_equity:
-                _daily_target_hit_at = datetime.now(IST_TZ).isoformat()
-                _daily_target_hit_equity = equity
-                log.warning(f"🛑 DAILY TARGET REACHED — equity ₹{equity:.2f} "
-                            f"≥ target ₹{target_equity:.2f} ({gain_pct:+.2f}% ≥ {DAILY_TARGET_PCT}%) "
-                            f"— closing all positions + pausing webhooks")
+            if pct >= PROFIT_LOCK_PCT:
                 close_all_positions(
-                    trigger_reason=f"daily target {gain_pct:.2f}% ≥ {DAILY_TARGET_PCT}%"
+                    trigger_reason=f"net ROE {pct:.2f}% ≥ {PROFIT_LOCK_PCT}%",
+                    trigger_pct=pct
                 )
-                _daily_paused = True
-                log.warning(f"🛑 PAUSED until IST midnight rollover or manual /daily-target/reset")
         except Exception as e:
-            log.error(f"daily-target worker error: {e}", exc_info=True)
+            log.error(f"profit-lock worker error: {e}", exc_info=True)
+
+
+def in_profit_lock_cooldown():
+    """Return True if we're currently in the post-lock cooldown window."""
+    return time.time() < _profit_lock_until
+
+
+def cooldown_remaining_sec():
+    remaining = _profit_lock_until - time.time()
+    return max(0, int(remaining))
 
 
 def log_trade_event(symbol, action, alert_type, result, reason=""):
@@ -538,21 +497,29 @@ def webhook():
         if not symbol:
             return jsonify({"status": "rejected", "reason": "missing symbol"}), 200
 
-        # ─── DAILY TARGET HARD-STOP GATE ──────────────────────
-        # If today's daily target was hit, reject EVERY webhook
-        # (entry/book/reverse/kill) regardless of type. State persists until
-        # IST midnight rollover OR manual /daily-target/reset.
-        if daily_target_paused():
-            hit_at = _daily_target_hit_at or "unknown"
-            hit_eq = _daily_target_hit_equity or 0
-            log.info(f"🛑 DAILY TARGET: rejecting {alert_type} for {symbol} "
-                     f"(target hit at ₹{hit_eq:.2f}, baseline ₹{_daily_baseline_equity:.2f})")
-            log_trade_event(symbol, action, alert_type, "DAILY_TARGET",
-                            f"hit_at={hit_at}")
+        # ─── DAILY CAP HARD-STOP GATE ─────────────────────────
+        # If today's cumulative locked profit ≥ DAILY_CAP_PCT, reject EVERY
+        # webhook (entry/book/reverse/kill) regardless of type. State persists
+        # until IST midnight rollover OR manual /daily-cap/reset.
+        if daily_cap_active():
+            log.info(f"🛑 DAILY CAP: rejecting {alert_type} for {symbol} "
+                     f"(cumulative {_daily_locked_pct_sum:.2f}% / cap {DAILY_CAP_PCT}%)")
+            log_trade_event(symbol, action, alert_type, "DAILY_CAP",
+                            f"sum={_daily_locked_pct_sum:.2f}%")
             return jsonify({
                 "status": "rejected",
-                "reason": f"daily target reached — paused until midnight IST or manual reset"
+                "reason": f"daily cap reached ({_daily_locked_pct_sum:.2f}% ≥ {DAILY_CAP_PCT}%)"
             }), 200
+
+        # ─── PROFIT-LOCK COOLDOWN GATE ────────────────────────
+        # After an auto-close-all, reject ALL webhooks (including entries)
+        # for COOLDOWN_AFTER_LOCK_SEC seconds. This lets Pine's internal
+        # state drift back into sync before we accept new trades.
+        if in_profit_lock_cooldown():
+            remaining = cooldown_remaining_sec()
+            log.info(f"🔒 COOLDOWN: rejecting {alert_type} for {symbol} — {remaining}s left")
+            log_trade_event(symbol, action, alert_type, "COOLDOWN", f"{remaining}s remaining")
+            return jsonify({"status": "rejected", "reason": f"profit-lock cooldown ({remaining}s)"}), 200
 
         # ─── ENTRY — initial position ─────────────────────────
         if alert_type == "entry":
@@ -749,138 +716,133 @@ def webhook():
 def status():
     pnl, margin, pct = compute_net_roe()
     pct_str = f"{pct:.2f}" if pct is not None else "unavailable"
-    equity, breakdown = compute_current_equity()
-    target_equity = (
-        _daily_baseline_equity * (1 + DAILY_TARGET_PCT / 100)
-        if _daily_baseline_equity else None
-    )
-    gain_pct = None
-    if equity is not None and _daily_baseline_equity:
-        gain_pct = round(((equity - _daily_baseline_equity) / _daily_baseline_equity) * 100, 2)
+    _check_and_reset_daily_counter()  # ensure counter reflects current IST date
     return jsonify({
         "active_trades": active_trades,
         "native_sl_orders": native_sl_orders,
         "positions": len(active_trades),
-        "live_pnl": {
+        "profit_lock": {
+            "enabled": PROFIT_LOCK_ENABLED,
+            "threshold_pct": PROFIT_LOCK_PCT,
+            "current_net_pct": pct_str,
             "net_pnl_inr": round(pnl, 2) if pnl is not None else None,
             "total_margin_inr": round(margin, 2) if margin is not None else None,
-            "net_pct_on_margin": pct_str,
+            "in_cooldown": in_profit_lock_cooldown(),
+            "cooldown_remaining_sec": cooldown_remaining_sec(),
         },
-        "daily_target": {
-            "enabled": DAILY_TARGET_ENABLED,
-            "target_pct": DAILY_TARGET_PCT,
-            "baseline_equity_inr": round(_daily_baseline_equity, 2) if _daily_baseline_equity else None,
-            "current_equity_inr": breakdown if breakdown else None,
-            "current_total_inr": round(equity, 2) if equity else None,
-            "target_equity_inr": round(target_equity, 2) if target_equity else None,
-            "gain_pct": gain_pct,
+        "daily_cap": {
+            "enabled": DAILY_CAP_ENABLED,
+            "cap_pct": DAILY_CAP_PCT,
+            "cumulative_locked_pct": round(_daily_locked_pct_sum, 2),
+            "lock_count_today": _daily_lock_count,
             "is_paused": _daily_paused,
-            "hit_at": _daily_target_hit_at,
-            "hit_equity_inr": round(_daily_target_hit_equity, 2) if _daily_target_hit_equity else None,
-            "baseline_taken_at": _daily_baseline_taken_at,
-            "baseline_date_ist": str(_daily_baseline_date) if _daily_baseline_date else None,
+            "ist_date": str(_daily_counter_date) if _daily_counter_date else None,
             "ist_now": datetime.now(IST_TZ).isoformat(),
         },
         "time": datetime.now().isoformat()
     })
 
-@app.route("/daily-target/check", methods=["GET"])
-def daily_target_check():
-    """Read-only view of daily target state. No auth required."""
-    equity, breakdown = compute_current_equity()
-    target_equity = (
-        _daily_baseline_equity * (1 + DAILY_TARGET_PCT / 100)
-        if _daily_baseline_equity else None
-    )
-    gain_pct = None
-    if equity is not None and _daily_baseline_equity:
-        gain_pct = round(((equity - _daily_baseline_equity) / _daily_baseline_equity) * 100, 2)
-    return jsonify({
-        "enabled": DAILY_TARGET_ENABLED,
-        "target_pct": DAILY_TARGET_PCT,
-        "baseline_equity_inr": round(_daily_baseline_equity, 2) if _daily_baseline_equity else None,
-        "current_equity_breakdown": breakdown,
-        "current_total_inr": round(equity, 2) if equity else None,
-        "target_equity_inr": round(target_equity, 2) if target_equity else None,
-        "gain_pct": gain_pct,
-        "remaining_pct_to_target": round(DAILY_TARGET_PCT - gain_pct, 2) if gain_pct is not None else None,
-        "would_trigger": (equity is not None and target_equity is not None and equity >= target_equity),
-        "is_paused": _daily_paused,
-        "hit_at": _daily_target_hit_at,
-        "baseline_taken_at": _daily_baseline_taken_at,
-        "baseline_date_ist": str(_daily_baseline_date) if _daily_baseline_date else None,
-        "ist_now": datetime.now(IST_TZ).isoformat(),
-    })
-
-@app.route("/daily-target/reset", methods=["POST", "GET"])
-def daily_target_reset():
-    """Manually unpause + take a fresh equity snapshot RIGHT NOW.
-    Use this when you want to start a new daily cycle without waiting for
-    IST midnight. Requires ?secret=... matching WEBHOOK_SECRET.
-    Does NOT close active positions — those continue running with new baseline."""
-    global _daily_paused
-    if WEBHOOK_SECRET and request.args.get("secret") != WEBHOOK_SECRET:
-        return jsonify({"error": "unauthorized"}), 401
-    prev_baseline = _daily_baseline_equity
-    prev_paused = _daily_paused
-    success = take_daily_snapshot(reason="manual /daily-target/reset")
-    if not success:
-        return jsonify({
-            "status": "snapshot_failed",
-            "reason": "could not fetch INR balance or compute equity — try again in a moment"
-        }), 503
-    log.info(f"🔄 Daily target manually reset by operator "
-             f"(was: baseline=₹{prev_baseline}, paused={prev_paused})")
-    return jsonify({
-        "status": "reset",
-        "previous": {
-            "baseline_equity_inr": round(prev_baseline, 2) if prev_baseline else None,
-            "was_paused": prev_paused,
-        },
-        "current": {
-            "baseline_equity_inr": round(_daily_baseline_equity, 2),
-            "is_paused": False,
-            "baseline_date_ist": str(_daily_baseline_date),
-            "baseline_taken_at": _daily_baseline_taken_at,
+@app.route("/profit-lock/check", methods=["GET"])
+def profit_lock_check():
+    """Force a manual profit-lock check; does NOT trigger close unless threshold met."""
+    pnl, margin, pct = compute_net_roe()
+    # Per-symbol price diagnostics
+    price_sources = {}
+    now = time.time()
+    for sym, trade in active_trades.items():
+        lkp = trade.get("last_known_price")
+        lkp_time = trade.get("last_known_price_time", 0)
+        age = int(now - lkp_time) if lkp_time else None
+        cached = _ticker_cache.get(sym)
+        price_sources[sym] = {
+            "webhook_price": lkp,
+            "webhook_price_age_sec": age,
+            "public_endpoint_cache": cached[0] if cached else None,
+            "using": (
+                "webhook" if (lkp and age is not None and age < 600)
+                else ("public_endpoint" if cached else "none/fallback_to_entry")
+            ),
         }
-    })
-
-@app.route("/daily-target/snapshot", methods=["POST", "GET"])
-def daily_target_snapshot():
-    """Force a fresh baseline snapshot WITHOUT lifting an existing pause.
-    Use case: redeploy mid-day and you want to re-anchor the baseline to
-    current equity. Requires ?secret=... matching WEBHOOK_SECRET."""
-    global _daily_paused
-    if WEBHOOK_SECRET and request.args.get("secret") != WEBHOOK_SECRET:
-        return jsonify({"error": "unauthorized"}), 401
-    prev_baseline = _daily_baseline_equity
-    was_paused = _daily_paused
-    success = take_daily_snapshot(reason="manual /daily-target/snapshot")
-    if not success:
-        return jsonify({"status": "snapshot_failed"}), 503
-    # take_daily_snapshot lifts pause; if you wanted pause preserved, restore it
-    if was_paused and request.args.get("preserve_pause") == "true":
-        _daily_paused = True
-        log.info(f"🔒 Pause preserved at operator request (preserve_pause=true)")
     return jsonify({
-        "status": "snapshot_taken",
-        "previous_baseline": round(prev_baseline, 2) if prev_baseline else None,
-        "new_baseline": round(_daily_baseline_equity, 2),
-        "was_paused": was_paused,
-        "is_paused_now": _daily_paused,
+        "net_pnl_inr": pnl,
+        "total_margin_inr": margin,
+        "net_pct": pct,
+        "threshold_pct": PROFIT_LOCK_PCT,
+        "would_trigger": (pct is not None and pct >= PROFIT_LOCK_PCT),
+        "in_cooldown": in_profit_lock_cooldown(),
+        "cooldown_remaining_sec": cooldown_remaining_sec(),
+        "price_sources": price_sources,
     })
 
-@app.route("/close-all", methods=["POST", "GET"])
-def close_all_endpoint():
-    """Manually close all open positions. Requires ?secret=... matching WEBHOOK_SECRET.
-    Does NOT pause the server — Pine alerts can re-enter on next bar."""
+@app.route("/profit-lock/force", methods=["POST", "GET"])
+def profit_lock_force():
+    """Manually trigger close-all-and-lock (for emergencies / testing).
+    Requires ?secret=... matching WEBHOOK_SECRET.
+    Computes current net% and contributes it to the daily cap counter."""
     if WEBHOOK_SECRET and request.args.get("secret") != WEBHOOK_SECRET:
         return jsonify({"error": "unauthorized"}), 401
     if not active_trades:
         return jsonify({"status": "no_positions", "active": 0})
     count = len(active_trades)
-    close_all_positions(trigger_reason="manual /close-all")
-    return jsonify({"status": "closed", "positions_closed": count})
+    pnl, margin, pct = compute_net_roe()
+    # If net% can't be computed, default to 0 — manual force shouldn't trip cap
+    close_all_positions(
+        trigger_reason="manual force",
+        trigger_pct=(pct if pct is not None else 0.0)
+    )
+    return jsonify({"status": "locked", "closed": count,
+                    "trigger_pct": pct,
+                    "cooldown_remaining_sec": cooldown_remaining_sec(),
+                    "daily_cumulative_pct": _daily_locked_pct_sum,
+                    "daily_paused": _daily_paused})
+
+@app.route("/daily-cap/reset", methods=["POST", "GET"])
+def daily_cap_reset():
+    """Manually unpause the daily cap and reset the cumulative counter to 0.
+    Useful when you want to start a new cycle without waiting for IST midnight.
+    Requires ?secret=... matching WEBHOOK_SECRET.
+    Does NOT clear active_trades or affect the profit-lock cooldown."""
+    global _daily_locked_pct_sum, _daily_lock_count, _daily_paused, _daily_counter_date
+    if WEBHOOK_SECRET and request.args.get("secret") != WEBHOOK_SECRET:
+        return jsonify({"error": "unauthorized"}), 401
+    prev_sum = _daily_locked_pct_sum
+    prev_count = _daily_lock_count
+    prev_paused = _daily_paused
+    _daily_locked_pct_sum = 0.0
+    _daily_lock_count = 0
+    _daily_paused = False
+    _daily_counter_date = _current_ist_date()
+    log.info(f"🔄 Daily cap manually reset by operator "
+             f"(was: locks={prev_count}, sum={prev_sum:.2f}%, paused={prev_paused})")
+    return jsonify({
+        "status": "reset",
+        "previous": {
+            "lock_count": prev_count,
+            "cumulative_pct": round(prev_sum, 2),
+            "was_paused": prev_paused,
+        },
+        "current": {
+            "lock_count": 0,
+            "cumulative_pct": 0.0,
+            "is_paused": False,
+            "ist_date": str(_daily_counter_date),
+        }
+    })
+
+@app.route("/daily-cap/check", methods=["GET"])
+def daily_cap_check():
+    """Read-only view of daily cap state."""
+    _check_and_reset_daily_counter()
+    return jsonify({
+        "enabled": DAILY_CAP_ENABLED,
+        "cap_pct": DAILY_CAP_PCT,
+        "cumulative_locked_pct": round(_daily_locked_pct_sum, 2),
+        "remaining_pct": round(max(0, DAILY_CAP_PCT - _daily_locked_pct_sum), 2),
+        "lock_count_today": _daily_lock_count,
+        "is_paused": _daily_paused,
+        "ist_date": str(_daily_counter_date) if _daily_counter_date else None,
+        "ist_now": datetime.now(IST_TZ).isoformat(),
+    })
 
 @app.route("/stats", methods=["GET"])
 def stats():
@@ -920,27 +882,15 @@ def health():
 load_tick_sizes()
 log.info("🤖 Trail TP/SL Rev Bot ready — Pine-driven bookings + native SL")
 
-# Daily-target initialization — take a baseline snapshot if appropriate.
-# - On first boot ever: snapshot regardless of time (caller accepts mid-day baseline)
-# - On boot after IST midnight 00:01: snapshot
-# - Otherwise: thread will wait until 00:01 IST passes naturally
-_now_ist = datetime.now(IST_TZ)
-log.info(f"📅 Daily-target system initializing — IST now {_now_ist.isoformat()}, "
-         f"target={DAILY_TARGET_PCT}%, enabled={DAILY_TARGET_ENABLED}")
-if DAILY_TARGET_ENABLED:
-    if _is_after_snapshot_time(_now_ist):
-        # We're past 00:01 IST today — take a snapshot now so the system can operate.
-        # Caveat (Option 1): if this is a mid-day boot, baseline reflects equity at boot,
-        # not at 00:01. Operator should hit /daily-target/snapshot if needed to rebaseline.
-        snapshot_ok = take_daily_snapshot(reason="server boot")
-        if not snapshot_ok:
-            log.warning("⚠️ Initial snapshot failed — daily-target worker will retry on first cycle")
-    else:
-        log.info(f"⏳ Pre-00:01 IST — daily-target worker will take first snapshot at 00:01")
+# Initialize daily-cap counter for today's IST date
+_check_and_reset_daily_counter()
+log.info(f"📅 Daily cap initialized — IST date {_daily_counter_date}, "
+         f"cap={DAILY_CAP_PCT}%, enabled={DAILY_CAP_ENABLED}")
 
-# Start the daily-target monitor thread (unconditional — self-gates on env var)
-_daily_target_thread = threading.Thread(target=daily_target_worker, daemon=True)
-_daily_target_thread.start()
+# Start the profit-lock monitor thread (unconditional — it self-gates on the
+# PROFIT_LOCK_ENABLED env var so you can flip it without a redeploy).
+_profit_lock_thread = threading.Thread(target=profit_lock_worker, daemon=True)
+_profit_lock_thread.start()
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
