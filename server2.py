@@ -160,6 +160,35 @@ _daily_counter_date        = None  # tracks which IST date the counter belongs t
 # IST timezone constant for date comparisons
 IST_TZ = timezone(timedelta(hours=5, minutes=30))
 
+# ═══════════════════════════════════════════════════════════
+#  BASELINE EQUITY TARGET — auto-rollover profit lock
+# ═══════════════════════════════════════════════════════════
+# Tracks cumulative realized P&L since a baseline was set. When current
+# equity (baseline + realized + unrealized) crosses baseline × (1 + trigger%),
+# closes all positions, banks the gain, and rolls baseline forward by
+# rollover% (less than trigger% — the gap is "banked profit").
+#
+# Example with trigger=6%, rollover=5%:
+#   baseline = 2000 → trigger at 2120 → new baseline = 2100 (banked 20)
+#   baseline = 2100 → trigger at 2226 → new baseline = 2205 (banked 21)
+#
+# State persists across restarts in BASELINE_FILE (use Railway volume for
+# durability; without volume, file resets on every redeploy and you re-set
+# baseline manually via /baseline/set).
+BASELINE_ENABLED        = os.environ.get("BASELINE_ENABLED", "false").lower() == "true"
+BASELINE_TRIGGER_PCT    = float(os.environ.get("BASELINE_TRIGGER_PCT", "6.0"))
+BASELINE_ROLLOVER_PCT   = float(os.environ.get("BASELINE_ROLLOVER_PCT", "5.0"))
+BASELINE_COOLDOWN_SEC   = int(os.environ.get("BASELINE_COOLDOWN_SEC", "60"))
+BASELINE_FILE           = os.environ.get("BASELINE_FILE", "/app/baseline_state.json")
+
+# Shared state
+_baseline_inr           = None   # current baseline (INR), None = not set
+_baseline_realized_pnl  = 0.0    # realized P&L in INR since baseline was last set/rolled
+_baseline_lock_count    = 0      # number of times baseline has triggered (since reset)
+_baseline_last_lock_at  = None   # ISO timestamp of last trigger
+_baseline_history       = []     # list of {timestamp, old_baseline, trigger_equity, new_baseline, realized}
+_baseline_cooldown_until = 0.0   # epoch — webhooks rejected (except book/close) until this
+
 FIXED_MARGIN_INR = float(os.environ.get("FIXED_MARGIN_INR", "0"))
 USDT_INR_RATE = float(os.environ.get("USDT_INR_RATE", "98"))
 WALLET_USAGE_PCT = float(os.environ.get("WALLET_USAGE_PCT", "100")) / 100
@@ -398,6 +427,173 @@ def cooldown_remaining_sec():
     return max(0, int(remaining))
 
 
+# ═══════════════════════════════════════════════════════════
+#  BASELINE HELPERS
+# ═══════════════════════════════════════════════════════════
+def load_baseline_state():
+    """Load baseline state from disk. Falls back to in-memory globals if file
+    is missing/corrupt. File survives Railway redeploys only if a volume is
+    mounted at the BASELINE_FILE's parent directory."""
+    global _baseline_inr, _baseline_realized_pnl, _baseline_lock_count
+    global _baseline_last_lock_at, _baseline_history
+    try:
+        with open(BASELINE_FILE) as f:
+            state = json.load(f)
+        _baseline_inr           = state.get("baseline")
+        _baseline_realized_pnl  = float(state.get("realized_pnl", 0.0))
+        _baseline_lock_count    = int(state.get("lock_count", 0))
+        _baseline_last_lock_at  = state.get("last_lock_at")
+        _baseline_history       = state.get("history", [])
+        log.info(f"📐 Baseline loaded: ₹{_baseline_inr}, realized=₹{_baseline_realized_pnl:.2f}, "
+                 f"locks={_baseline_lock_count}")
+    except FileNotFoundError:
+        log.info(f"📐 No baseline file at {BASELINE_FILE} — baseline starts uninitialized")
+    except (json.JSONDecodeError, ValueError, KeyError) as e:
+        log.warning(f"⚠️ Baseline file corrupt ({e}) — starting fresh")
+
+
+def save_baseline_state():
+    """Persist current baseline state to disk."""
+    try:
+        os.makedirs(os.path.dirname(BASELINE_FILE), exist_ok=True)
+        with open(BASELINE_FILE, "w") as f:
+            json.dump({
+                "baseline": _baseline_inr,
+                "realized_pnl": _baseline_realized_pnl,
+                "lock_count": _baseline_lock_count,
+                "last_lock_at": _baseline_last_lock_at,
+                "history": _baseline_history[-50:],  # keep last 50 events
+            }, f, indent=2)
+    except Exception as e:
+        log.error(f"❌ Failed to save baseline: {e}")
+
+
+def baseline_current_equity():
+    """Compute current account equity in INR from internal state.
+    = baseline + realized P&L since baseline + unrealized P&L on open positions.
+    Returns None if equity can't be computed (e.g. price fetch failed)."""
+    if _baseline_inr is None:
+        return None
+    pnl_open, _, _ = compute_net_roe()
+    if pnl_open is None:
+        # Price fetch failed — treat unrealized as 0 (conservative for upside check)
+        pnl_open = 0.0
+    return _baseline_inr + _baseline_realized_pnl + pnl_open
+
+
+def in_baseline_cooldown():
+    """Return True if we're in the post-baseline-trigger cooldown window."""
+    return time.time() < _baseline_cooldown_until
+
+
+def baseline_cooldown_remaining_sec():
+    return max(0, int(_baseline_cooldown_until - time.time()))
+
+
+def trigger_baseline_lock():
+    """Called from the worker when current equity crosses target.
+    Closes all positions, banks the gain, rolls baseline forward, activates
+    cooldown. Updates state file."""
+    global _baseline_inr, _baseline_realized_pnl, _baseline_lock_count
+    global _baseline_last_lock_at, _baseline_history, _baseline_cooldown_until
+
+    old_baseline = _baseline_inr
+    if old_baseline is None or old_baseline <= 0:
+        return  # Defensive guard
+
+    equity_at_trigger = baseline_current_equity()
+    if equity_at_trigger is None:
+        log.warning("⚠️ Baseline trigger aborted — equity unavailable")
+        return
+
+    log.info(f"🎯 BASELINE TRIGGER: equity ₹{equity_at_trigger:.2f} ≥ "
+             f"target ₹{old_baseline * (1 + BASELINE_TRIGGER_PCT/100):.2f}")
+
+    # Close all positions using the existing profit-lock close machinery.
+    # This handles native SLs, market closes, log_trade_event, and clears
+    # active_trades. We pass trigger_pct=None so it does NOT bump the
+    # daily-cap counter (baseline locks are independent of daily-cap).
+    close_all_positions(
+        trigger_reason=f"baseline target — equity ₹{equity_at_trigger:.2f} ≥ "
+                       f"₹{old_baseline * (1 + BASELINE_TRIGGER_PCT/100):.2f}",
+        trigger_pct=None
+    )
+
+    # Roll baseline forward
+    new_baseline = old_baseline * (1 + BASELINE_ROLLOVER_PCT / 100)
+    realized_this_cycle = equity_at_trigger - old_baseline
+
+    _baseline_inr = new_baseline
+    _baseline_realized_pnl = 0.0  # reset for new cycle
+    _baseline_lock_count += 1
+    _baseline_last_lock_at = datetime.now(timezone.utc).isoformat()
+    _baseline_history.append({
+        "timestamp": _baseline_last_lock_at,
+        "old_baseline": old_baseline,
+        "trigger_equity": equity_at_trigger,
+        "new_baseline": new_baseline,
+        "realized_pnl": realized_this_cycle,
+    })
+
+    # Activate baseline-specific cooldown (independent of profit-lock cooldown)
+    _baseline_cooldown_until = time.time() + BASELINE_COOLDOWN_SEC
+
+    save_baseline_state()
+    log.info(f"📈 Baseline rolled: ₹{old_baseline:.2f} → ₹{new_baseline:.2f} "
+             f"(banked ₹{(new_baseline - old_baseline) - 0:.2f} buffer of ₹{realized_this_cycle - (new_baseline - old_baseline):.2f}, "
+             f"cooldown={BASELINE_COOLDOWN_SEC}s)")
+
+
+def baseline_record_realized_pnl(symbol, entry_price, exit_price, qty, side, leverage):
+    """Add realized P&L from a closed (or partially closed) position to the
+    baseline accumulator. Called from book/reverse/close handlers.
+    No-op if baseline isn't initialized."""
+    global _baseline_realized_pnl
+    if _baseline_inr is None:
+        return
+    try:
+        entry = float(entry_price or 0)
+        exit_ = float(exit_price or 0)
+        q     = float(qty or 0)
+        if entry <= 0 or exit_ <= 0 or q <= 0:
+            return
+        direction = 1 if side == "buy" else -1
+        pnl_usd = (exit_ - entry) * q * direction
+        pnl_inr = pnl_usd * USDT_INR_RATE
+        _baseline_realized_pnl += pnl_inr
+        log.info(f"📐 Realized P&L recorded: {symbol} {side} {q} @ {entry}→{exit_} = "
+                 f"₹{pnl_inr:+.2f} | total since baseline: ₹{_baseline_realized_pnl:+.2f}")
+        save_baseline_state()
+    except Exception as e:
+        log.warning(f"baseline_record_realized_pnl failed for {symbol}: {e}")
+
+
+def baseline_worker():
+    """Background thread: every POLL_INTERVAL_SEC, checks if baseline target
+    has been crossed and fires the lock if so. Self-gates on BASELINE_ENABLED
+    so you can flip it via env var without redeploy (after restart)."""
+    log.info(f"📐 Baseline monitor started — trigger={BASELINE_TRIGGER_PCT}%, "
+             f"rollover={BASELINE_ROLLOVER_PCT}%, cooldown={BASELINE_COOLDOWN_SEC}s, "
+             f"poll={POLL_INTERVAL_SEC}s, file={BASELINE_FILE}")
+    while True:
+        try:
+            time.sleep(POLL_INTERVAL_SEC)
+            if not BASELINE_ENABLED:
+                continue
+            if _baseline_inr is None or _baseline_inr <= 0:
+                continue  # Not initialized
+            if in_baseline_cooldown():
+                continue  # Already triggered, in cooldown
+            equity = baseline_current_equity()
+            if equity is None:
+                continue
+            target = _baseline_inr * (1 + BASELINE_TRIGGER_PCT / 100)
+            if equity >= target:
+                trigger_baseline_lock()
+        except Exception as e:
+            log.error(f"baseline worker error: {e}", exc_info=True)
+
+
 def log_trade_event(symbol, action, alert_type, result, reason=""):
     trade_log.append({
         "time": datetime.now().strftime("%H:%M:%S"),
@@ -521,6 +717,17 @@ def webhook():
             log_trade_event(symbol, action, alert_type, "COOLDOWN", f"{remaining}s remaining")
             return jsonify({"status": "rejected", "reason": f"profit-lock cooldown ({remaining}s)"}), 200
 
+        # ─── BASELINE COOLDOWN GATE ───────────────────────────
+        # After a baseline trigger fires, reject ENTRY and REVERSE webhooks
+        # for BASELINE_COOLDOWN_SEC seconds. BOOK and CLOSE are allowed
+        # through so any in-flight Pine signals on positions that somehow
+        # remained open can still be processed cleanly.
+        if in_baseline_cooldown() and alert_type in ("entry", "reverse"):
+            remaining = baseline_cooldown_remaining_sec()
+            log.info(f"📐 BASELINE COOLDOWN: rejecting {alert_type} for {symbol} — {remaining}s left")
+            log_trade_event(symbol, action, alert_type, "BASELINE_COOLDOWN", f"{remaining}s remaining")
+            return jsonify({"status": "rejected", "reason": f"baseline cooldown ({remaining}s)"}), 200
+
         # ─── ENTRY — initial position ─────────────────────────
         if alert_type == "entry":
             if symbol in active_trades:
@@ -606,6 +813,16 @@ def webhook():
             if sl_price:
                 trade["sl_price"] = sl_price
 
+            # Record realized P&L for baseline tracking (partial book)
+            baseline_record_realized_pnl(
+                symbol=symbol,
+                entry_price=trade["entry_price"],
+                exit_price=coin_price,
+                qty=book_qty,
+                side=trade["side"],
+                leverage=leverage
+            )
+
             log.info(f"✅ Booked {book_qty} {symbol} — remaining: {trade['qty']:.4f} | new TP={tp_price} SL={sl_price}")
             log_trade_event(symbol, action, "book", "FILLED", f"book #{trade['books_done']}, remaining={trade['qty']:.4f}")
 
@@ -634,6 +851,16 @@ def webhook():
                     if isinstance(close_result, dict) and close_result.get("status") == "error":
                         err = close_result.get("message", "")
                         log.warning(f"⚠️ Reverse close failed (likely already closed): {err}")
+
+                # Record realized P&L for baseline tracking (full close on SL)
+                baseline_record_realized_pnl(
+                    symbol=symbol,
+                    entry_price=trade["entry_price"],
+                    exit_price=coin_price,
+                    qty=close_qty,
+                    side=trade["side"],
+                    leverage=leverage
+                )
 
                 clear_active_trade(symbol, "reverse — SL hit")
                 log_trade_event(symbol, close_side, "reverse_close", "FILLED", "Pine reverse")
@@ -670,11 +897,15 @@ def webhook():
 
             return jsonify({"status": "reversed", "order": result}), 200
 
-        # ─── CLOSE — kill switch ──────────────────────────────
+        # ─── CLOSE — kill switch / SL-wait close-only ─────────
         elif alert_type == "close":
             reason = data.get("reason", "unknown")
             ret_pct = data.get("return_pct", "?")
-            log.info(f"☠️ KILL SWITCH: {symbol} — reason={reason}, return={ret_pct}%")
+            # Distinguish SL-wait from kill switch in logs
+            if reason == "sl_wait":
+                log.info(f"⏳ SL-WAIT close: {symbol}")
+            else:
+                log.info(f"☠️ KILL SWITCH: {symbol} — reason={reason}, return={ret_pct}%")
 
             cancel_native_sl(symbol)
 
@@ -684,22 +915,38 @@ def webhook():
                 close_side = "sell" if trade["side"] == "buy" else "buy"
 
                 if close_qty > 0:
-                    log.info(f"🔻 KILL close: {close_side.upper()} {close_qty} {symbol}")
+                    log.info(f"🔻 {('SL-WAIT' if reason == 'sl_wait' else 'KILL')} close: "
+                             f"{close_side.upper()} {close_qty} {symbol}")
                     result = client.place_order(
                         pair=symbol, side=close_side, order_type="market_order",
                         total_quantity=close_qty, leverage=trade.get("leverage", leverage),
                         margin_currency=trade.get("margin_ccy", margin_ccy)
                     )
                     if isinstance(result, dict) and result.get("status") == "error":
-                        log.warning(f"⚠️ Kill close may have failed: {result.get('message','')}")
+                        log.warning(f"⚠️ Close may have failed: {result.get('message','')}")
 
-                clear_active_trade(symbol, f"kill switch — return {ret_pct}%")
-                log_trade_event(symbol, close_side, "kill", "FILLED", f"return={ret_pct}%")
+                # Record realized P&L for baseline tracking
+                baseline_record_realized_pnl(
+                    symbol=symbol,
+                    entry_price=trade["entry_price"],
+                    exit_price=coin_price,
+                    qty=close_qty,
+                    side=trade["side"],
+                    leverage=leverage
+                )
+
+                clear_active_trade(symbol, f"{reason}")
+                log_trade_event(symbol, close_side,
+                                "sl_wait" if reason == "sl_wait" else "kill",
+                                "FILLED",
+                                f"reason={reason}")
             else:
-                log.info(f"⚠️ Kill for {symbol} but not tracked — no action needed")
-                log_trade_event(symbol, action, "kill", "SKIP", "not tracked")
+                log.info(f"⚠️ Close for {symbol} but not tracked — no action needed")
+                log_trade_event(symbol, action,
+                                "sl_wait" if reason == "sl_wait" else "kill",
+                                "SKIP", "not tracked")
 
-            return jsonify({"status": "killed", "symbol": symbol}), 200
+            return jsonify({"status": "closed", "symbol": symbol, "reason": reason}), 200
 
         else:
             return jsonify({"status": "unknown_type", "type": alert_type}), 200
@@ -870,6 +1117,93 @@ def clear_lock():
         active_trades.clear()
         return jsonify({"status": "ok", "cleared": count})
 
+
+# ═══════════════════════════════════════════════════════════
+#  BASELINE ENDPOINTS
+# ═══════════════════════════════════════════════════════════
+@app.route("/baseline/status", methods=["GET"])
+def baseline_status():
+    if _baseline_inr is None:
+        return jsonify({
+            "enabled": BASELINE_ENABLED,
+            "baseline": None,
+            "message": "Baseline not set. Call /baseline/set?value=N&secret=... to initialize.",
+            "trigger_pct": BASELINE_TRIGGER_PCT,
+            "rollover_pct": BASELINE_ROLLOVER_PCT,
+            "cooldown_sec": BASELINE_COOLDOWN_SEC,
+        }), 200
+    pnl_open, _, _ = compute_net_roe()
+    pnl_open_safe = pnl_open if pnl_open is not None else 0.0
+    current_equity = _baseline_inr + _baseline_realized_pnl + pnl_open_safe
+    target = _baseline_inr * (1 + BASELINE_TRIGGER_PCT / 100)
+    next_target_after_lock = (_baseline_inr * (1 + BASELINE_ROLLOVER_PCT / 100)) * (1 + BASELINE_TRIGGER_PCT / 100)
+    return jsonify({
+        "enabled": BASELINE_ENABLED,
+        "baseline_inr": round(_baseline_inr, 2),
+        "realized_pnl_since_baseline": round(_baseline_realized_pnl, 2),
+        "unrealized_pnl_open": round(pnl_open_safe, 2) if pnl_open is not None else "unavailable",
+        "current_equity": round(current_equity, 2),
+        "trigger_pct": BASELINE_TRIGGER_PCT,
+        "target_value": round(target, 2),
+        "pct_to_target": round((current_equity / target - 1) * 100, 2),
+        "rollover_pct": BASELINE_ROLLOVER_PCT,
+        "next_baseline_after_lock": round(_baseline_inr * (1 + BASELINE_ROLLOVER_PCT / 100), 2),
+        "next_target_after_lock": round(next_target_after_lock, 2),
+        "in_cooldown": in_baseline_cooldown(),
+        "cooldown_remaining_sec": baseline_cooldown_remaining_sec(),
+        "lock_count": _baseline_lock_count,
+        "last_lock_at": _baseline_last_lock_at,
+        "history_count": len(_baseline_history),
+        "history_recent": _baseline_history[-5:],
+    }), 200
+
+
+@app.route("/baseline/set", methods=["POST", "GET"])
+def baseline_set():
+    if request.args.get("secret") != WEBHOOK_SECRET:
+        return jsonify({"error": "unauthorized"}), 401
+    raw = request.args.get("value")
+    if raw is None:
+        return jsonify({"error": "missing 'value' query param (e.g. ?value=2000)"}), 400
+    try:
+        value = float(raw)
+        if value <= 0:
+            raise ValueError("must be positive")
+    except ValueError:
+        return jsonify({"error": f"invalid value '{raw}'"}), 400
+
+    global _baseline_inr, _baseline_realized_pnl
+    old = _baseline_inr
+    _baseline_inr = value
+    _baseline_realized_pnl = 0.0  # reset since this is a fresh anchor
+    save_baseline_state()
+    log.info(f"📐 Baseline manually set: ₹{old} → ₹{value} (realized P&L reset to 0)")
+    return jsonify({
+        "status": "set",
+        "baseline_inr": value,
+        "previous_baseline": old,
+        "trigger_value": round(value * (1 + BASELINE_TRIGGER_PCT / 100), 2),
+        "trigger_pct": BASELINE_TRIGGER_PCT,
+    }), 200
+
+
+@app.route("/baseline/reset", methods=["POST", "GET"])
+def baseline_reset():
+    if request.args.get("secret") != WEBHOOK_SECRET:
+        return jsonify({"error": "unauthorized"}), 401
+    global _baseline_inr, _baseline_realized_pnl, _baseline_lock_count
+    global _baseline_last_lock_at, _baseline_history, _baseline_cooldown_until
+    _baseline_inr = None
+    _baseline_realized_pnl = 0.0
+    _baseline_lock_count = 0
+    _baseline_last_lock_at = None
+    _baseline_history = []
+    _baseline_cooldown_until = 0.0
+    save_baseline_state()
+    log.info("📐 Baseline RESET — uninitialized, all history cleared")
+    return jsonify({"status": "reset"}), 200
+
+
 @app.route("/health", methods=["GET"])
 def health():
     return jsonify({
@@ -887,10 +1221,20 @@ _check_and_reset_daily_counter()
 log.info(f"📅 Daily cap initialized — IST date {_daily_counter_date}, "
          f"cap={DAILY_CAP_PCT}%, enabled={DAILY_CAP_ENABLED}")
 
+# Load baseline state from disk (persists across redeploys if volume mounted)
+load_baseline_state()
+log.info(f"📐 Baseline initialized — enabled={BASELINE_ENABLED}, "
+         f"current=₹{_baseline_inr if _baseline_inr is not None else 'unset'}, "
+         f"trigger={BASELINE_TRIGGER_PCT}%, rollover={BASELINE_ROLLOVER_PCT}%")
+
 # Start the profit-lock monitor thread (unconditional — it self-gates on the
 # PROFIT_LOCK_ENABLED env var so you can flip it without a redeploy).
 _profit_lock_thread = threading.Thread(target=profit_lock_worker, daemon=True)
 _profit_lock_thread.start()
+
+# Start the baseline monitor thread (unconditional — self-gates on BASELINE_ENABLED).
+_baseline_thread = threading.Thread(target=baseline_worker, daemon=True)
+_baseline_thread.start()
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
