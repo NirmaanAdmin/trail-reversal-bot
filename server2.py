@@ -193,6 +193,65 @@ FIXED_MARGIN_INR = float(os.environ.get("FIXED_MARGIN_INR", "0"))
 USDT_INR_RATE = float(os.environ.get("USDT_INR_RATE", "98"))
 WALLET_USAGE_PCT = float(os.environ.get("WALLET_USAGE_PCT", "100")) / 100
 
+# ─── SL LOCKOUT ──────────────────────────────────────────────
+# When Pine emits an sl_wait close on a symbol, mark it as locked.
+# Any subsequent entry/reverse webhook for that symbol is rejected
+# until the lockout expires. Pine signals continue arriving and are
+# logged but no orders are placed on CoinDCX. After SL_LOCKOUT_SEC
+# elapses, the symbol is freed and the next Pine signal is accepted
+# normally. State is in-memory only — Railway restart wipes it (the
+# worst case is one extra trade we'd otherwise have skipped).
+SL_LOCKOUT_ENABLED   = os.environ.get("SL_LOCKOUT_ENABLED", "true").lower() == "true"
+SL_LOCKOUT_SEC       = int(os.environ.get("SL_LOCKOUT_SEC", "600"))    # 10 min
+SL_LOCKOUT_CHECK_SEC = int(os.environ.get("SL_LOCKOUT_CHECK_SEC", "30"))
+_sl_lockout = {}  # {symbol: unlock_epoch_time}
+
+def mark_sl_lockout(symbol, reason=""):
+    """Called from the sl_wait close branch — locks the symbol for
+    SL_LOCKOUT_SEC seconds. Subsequent calls reset the timer."""
+    if not SL_LOCKOUT_ENABLED:
+        return
+    until = time.time() + SL_LOCKOUT_SEC
+    _sl_lockout[symbol] = until
+    mins = SL_LOCKOUT_SEC // 60
+    log.info(f"🚫 SL LOCKOUT armed: {symbol} blocked for {mins}m ({reason})")
+
+def in_sl_lockout(symbol):
+    """Returns (locked: bool, remaining_sec: int). Lazy-deletes expired entries."""
+    if not SL_LOCKOUT_ENABLED:
+        return False, 0
+    until = _sl_lockout.get(symbol, 0)
+    if until == 0:
+        return False, 0
+    remaining = int(until - time.time())
+    if remaining <= 0:
+        _sl_lockout.pop(symbol, None)
+        return False, 0
+    return True, remaining
+
+def sl_lockout_worker():
+    """Background thread: every SL_LOCKOUT_CHECK_SEC, prunes expired
+    locks and emits a heartbeat log of what's currently locked."""
+    log.info(f"🚫 SL lockout monitor started — enabled={SL_LOCKOUT_ENABLED}, "
+             f"duration={SL_LOCKOUT_SEC}s, check_every={SL_LOCKOUT_CHECK_SEC}s")
+    while True:
+        try:
+            time.sleep(SL_LOCKOUT_CHECK_SEC)
+            if not SL_LOCKOUT_ENABLED:
+                continue
+            now = time.time()
+            expired = [s for s, until in list(_sl_lockout.items()) if until <= now]
+            for s in expired:
+                _sl_lockout.pop(s, None)
+                log.info(f"✅ SL LOCKOUT cleared: {s} — symbol free to re-enter")
+            if _sl_lockout:
+                pretty = ", ".join(
+                    f"{s}({int(u-now)}s left)" for s, u in _sl_lockout.items()
+                )
+                log.info(f"🚫 SL lockout active: {pretty}")
+        except Exception as e:
+            log.error(f"sl_lockout_worker error: {e}", exc_info=True)
+
 # ─── Event Log ───
 trade_log = []
 MAX_LOG = 50
@@ -728,6 +787,20 @@ def webhook():
             log_trade_event(symbol, action, alert_type, "BASELINE_COOLDOWN", f"{remaining}s remaining")
             return jsonify({"status": "rejected", "reason": f"baseline cooldown ({remaining}s)"}), 200
 
+        # ─── SL LOCKOUT GATE ──────────────────────────────────
+        # If this symbol's SL was hit within SL_LOCKOUT_SEC, reject
+        # any new entry/reverse for it. Books and closes pass through
+        # so any in-flight Pine signals on still-open positions can
+        # resolve cleanly. After the lockout expires, the next Pine
+        # entry/reverse for this symbol is accepted normally.
+        if alert_type in ("entry", "reverse"):
+            locked, remaining = in_sl_lockout(symbol)
+            if locked:
+                log.info(f"🚫 SL LOCKOUT: rejecting {alert_type} for {symbol} — {remaining}s left")
+                log_trade_event(symbol, action, alert_type, "SL_LOCKOUT", f"{remaining}s remaining")
+                return jsonify({"status": "rejected",
+                                "reason": f"SL lockout on {symbol} ({remaining}s)"}), 200
+
         # ─── ENTRY — initial position ─────────────────────────
         if alert_type == "entry":
             if symbol in active_trades:
@@ -904,6 +977,7 @@ def webhook():
             # Distinguish SL-wait from kill switch in logs
             if reason == "sl_wait":
                 log.info(f"⏳ SL-WAIT close: {symbol}")
+                mark_sl_lockout(symbol, reason="Pine sl_wait close")
             else:
                 log.info(f"☠️ KILL SWITCH: {symbol} — reason={reason}, return={ret_pct}%")
 
@@ -1119,6 +1193,50 @@ def clear_lock():
 
 
 # ═══════════════════════════════════════════════════════════
+#  SL LOCKOUT ENDPOINTS
+# ═══════════════════════════════════════════════════════════
+@app.route("/sl-lockout/status", methods=["GET"])
+def sl_lockout_status():
+    """Returns currently locked symbols with remaining seconds.
+    No auth required (read-only, no sensitive info)."""
+    now = time.time()
+    locked = {}
+    for sym, until in list(_sl_lockout.items()):
+        remaining = int(until - now)
+        if remaining > 0:
+            locked[sym] = remaining
+        else:
+            _sl_lockout.pop(sym, None)
+    return jsonify({
+        "enabled": SL_LOCKOUT_ENABLED,
+        "duration_sec": SL_LOCKOUT_SEC,
+        "check_interval_sec": SL_LOCKOUT_CHECK_SEC,
+        "locked_count": len(locked),
+        "locked": locked,
+    }), 200
+
+
+@app.route("/sl-lockout/clear", methods=["POST", "GET"])
+def sl_lockout_clear():
+    """Manually clear SL lockouts. ?symbol=X clears one, no arg clears all.
+    Requires ?secret=... matching WEBHOOK_SECRET."""
+    if WEBHOOK_SECRET and request.args.get("secret") != WEBHOOK_SECRET:
+        return jsonify({"error": "unauthorized"}), 401
+    symbol = request.args.get("symbol")
+    if symbol:
+        existed = _sl_lockout.pop(symbol, None) is not None
+        if existed:
+            log.info(f"🔓 SL LOCKOUT manually cleared: {symbol}")
+        return jsonify({"status": "ok", "cleared": symbol if existed else None})
+    else:
+        count = len(_sl_lockout)
+        _sl_lockout.clear()
+        if count:
+            log.info(f"🔓 SL LOCKOUT manually cleared all ({count} symbols)")
+        return jsonify({"status": "ok", "cleared_count": count})
+
+
+# ═══════════════════════════════════════════════════════════
 #  BASELINE ENDPOINTS
 # ═══════════════════════════════════════════════════════════
 @app.route("/baseline/status", methods=["GET"])
@@ -1235,6 +1353,10 @@ _profit_lock_thread.start()
 # Start the baseline monitor thread (unconditional — self-gates on BASELINE_ENABLED).
 _baseline_thread = threading.Thread(target=baseline_worker, daemon=True)
 _baseline_thread.start()
+
+# Start the SL lockout monitor thread (unconditional — self-gates on SL_LOCKOUT_ENABLED).
+_sl_lockout_thread = threading.Thread(target=sl_lockout_worker, daemon=True)
+_sl_lockout_thread.start()
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
