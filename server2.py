@@ -977,7 +977,15 @@ def webhook():
             # Distinguish SL-wait from kill switch in logs
             if reason == "sl_wait":
                 log.info(f"⏳ SL-WAIT close: {symbol}")
-                mark_sl_lockout(symbol, reason="Pine sl_wait close")
+                # Only arm lockout if we actually held this position. Pine emits
+                # sl_wait for every SL on every watched symbol, but the lockout
+                # is only meaningful for positions the server was tracking —
+                # otherwise we'd block the next legitimate fresh entry on a
+                # symbol we never had a position on in the first place.
+                if symbol in active_trades:
+                    mark_sl_lockout(symbol, reason="Pine sl_wait close on tracked position")
+                else:
+                    log.info(f"⏳ SL-WAIT for {symbol} ignored for lockout — not in active_trades")
             else:
                 log.info(f"☠️ KILL SWITCH: {symbol} — reason={reason}, return={ret_pct}%")
 
