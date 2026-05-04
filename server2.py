@@ -33,6 +33,16 @@ def _sign_post(endpoint, body):
     headers = {"Content-Type": "application/json", "X-AUTH-APIKEY": API_KEY, "X-AUTH-SIGNATURE": sig}
     return _req.post(f"https://api.coindcx.com{endpoint}", data=json_body, headers=headers, timeout=15)
 
+def _signed_get(endpoint, body=None):
+    """Some CoinDCX endpoints (futures wallets) take signed GETs.
+    Sends the signed JSON body alongside a GET. Returns the raw response."""
+    body = (body or {}).copy()
+    body["timestamp"] = int(round(time.time() * 1000))
+    json_body = json.dumps(body, separators=(",", ":"))
+    sig = _hmac.new(API_SECRET.encode(), json_body.encode(), _hashlib.sha256).hexdigest()
+    headers = {"Content-Type": "application/json", "X-AUTH-APIKEY": API_KEY, "X-AUTH-SIGNATURE": sig}
+    return _req.get(f"https://api.coindcx.com{endpoint}", data=json_body, headers=headers, timeout=15)
+
 # ─── Tick Size Cache ──────────────────────────────────────────
 tick_cache = {}
 tick_cache_time = 0
@@ -251,6 +261,166 @@ def sl_lockout_worker():
                 log.info(f"🚫 SL lockout active: {pretty}")
         except Exception as e:
             log.error(f"sl_lockout_worker error: {e}", exc_info=True)
+
+
+# ═══════════════════════════════════════════════════════════
+#  TARGET CURRENT VALUE — wallet-based hard stop
+#
+#  Polls CoinDCX wallet + positions every TARGET_POLL_SEC. Computes the
+#  same "Current value" that CoinDCX UI shows: wallet (Available + Locked)
+#  + sum of unrealized P&L across ALL positions (orphan-proof — queries
+#  CoinDCX directly, doesn't rely on active_trades dict).
+#
+#  When current_value >= TARGET_CURRENT_VALUE, a flag flips and entry/reverse
+#  webhooks are rejected. Books and closes still pass through so existing
+#  positions can resolve. To resume trading, set a new (higher) target via
+#  /target/set?value=N&secret=... — this clears the hit flag.
+#
+#  State persists across Railway restarts in TARGET_FILE on the volume.
+# ═══════════════════════════════════════════════════════════
+TARGET_ENABLED        = os.environ.get("TARGET_ENABLED", "true").lower() == "true"
+TARGET_CURRENT_VALUE  = float(os.environ.get("TARGET_CURRENT_VALUE", "0"))  # 0 = disabled
+TARGET_POLL_SEC       = int(os.environ.get("TARGET_POLL_SEC", "5"))
+TARGET_FILE           = os.environ.get("TARGET_FILE", "/app/data/target_state.json")
+
+_target_value         = TARGET_CURRENT_VALUE  # mutable; can be updated via endpoint
+_target_hit           = False                 # True once current_value >= target
+_target_hit_at        = None                  # ISO timestamp when first hit
+_target_last_value    = None                  # last computed current_value (for /status)
+_target_last_check_at = None                  # ISO timestamp of last successful poll
+_target_last_error    = None                  # last poll error if any
+
+
+def fetch_real_wallet_inr():
+    """Fetch CoinDCX futures wallet INR balance (Available + Locked).
+    Returns float or None on failure. This matches CoinDCX UI's
+    'Available + Locked margin' exactly."""
+    try:
+        resp = _signed_get("/exchange/v1/derivatives/futures/wallets")
+        if resp.status_code != 200:
+            return None
+        wallets = resp.json()
+        for w in wallets:
+            if w.get("currency_short_name") == "INR":
+                bal = float(w.get("balance", 0) or 0)
+                locked = float(w.get("locked_balance", 0) or 0)
+                return bal + locked
+        return None
+    except Exception as e:
+        log.warning(f"target: wallet fetch failed: {e}")
+        return None
+
+
+def fetch_real_positions_unrealized_inr():
+    """Sum unrealized P&L across ALL active CoinDCX positions in INR.
+    Orphan-proof: asks CoinDCX directly, not active_trades. Returns float
+    or None on failure."""
+    try:
+        resp = _sign_post(
+            "/exchange/v1/derivatives/futures/positions",
+            {"page": "1", "size": "100", "margin_currency_short_name": ["INR"]},
+        )
+        if resp.status_code != 200:
+            return None
+        positions = resp.json()
+        total_inr = 0.0
+        for p in positions:
+            qty = float(p.get("active_pos", 0) or 0)
+            if qty == 0:
+                continue
+            avg = float(p.get("avg_price", 0) or 0)
+            mark = float(p.get("mark_price", 0) or 0)
+            rate = float(p.get("settlement_currency_avg_price", 0) or 0)
+            if avg <= 0 or mark <= 0 or rate <= 0:
+                continue
+            direction = 1 if qty > 0 else -1
+            unrealized_usdt = direction * (mark - avg) * abs(qty)
+            total_inr += unrealized_usdt * rate
+        return total_inr
+    except Exception as e:
+        log.warning(f"target: positions fetch failed: {e}")
+        return None
+
+
+def fetch_real_current_value():
+    """Compute the same 'Current value' shown in CoinDCX UI.
+    Returns (current_value, wallet_inr, unrealized_inr) or (None, None, None)
+    on failure."""
+    wallet = fetch_real_wallet_inr()
+    if wallet is None:
+        return None, None, None
+    unrealized = fetch_real_positions_unrealized_inr()
+    if unrealized is None:
+        return None, wallet, None
+    return wallet + unrealized, wallet, unrealized
+
+
+def load_target_state():
+    """Load TARGET state from disk. Survives Railway restarts when volume
+    is mounted at TARGET_FILE's parent directory."""
+    global _target_value, _target_hit, _target_hit_at
+    try:
+        with open(TARGET_FILE) as f:
+            state = json.load(f)
+        _target_value  = float(state.get("target_value", TARGET_CURRENT_VALUE))
+        _target_hit    = bool(state.get("hit", False))
+        _target_hit_at = state.get("hit_at")
+        log.info(f"🎯 Target state loaded: target=₹{_target_value}, "
+                 f"hit={_target_hit}, hit_at={_target_hit_at}")
+    except FileNotFoundError:
+        log.info(f"🎯 No target file at {TARGET_FILE} — using env default ₹{TARGET_CURRENT_VALUE}")
+    except (json.JSONDecodeError, ValueError, KeyError) as e:
+        log.warning(f"⚠️ Target file corrupt ({e}) — using env default ₹{TARGET_CURRENT_VALUE}")
+
+
+def save_target_state():
+    """Persist current TARGET state to disk."""
+    try:
+        os.makedirs(os.path.dirname(TARGET_FILE), exist_ok=True)
+        with open(TARGET_FILE, "w") as f:
+            json.dump({
+                "target_value": _target_value,
+                "hit": _target_hit,
+                "hit_at": _target_hit_at,
+            }, f, indent=2)
+    except Exception as e:
+        log.error(f"❌ Failed to save target state: {e}")
+
+
+def target_worker():
+    """Background thread: every TARGET_POLL_SEC, fetches real wallet + positions
+    from CoinDCX, computes current value, and flips _target_hit if target reached.
+    Self-gates on TARGET_ENABLED and _target_value > 0 so it can be paused via
+    env var or by clearing the target."""
+    global _target_hit, _target_hit_at, _target_last_value, _target_last_check_at, _target_last_error
+    log.info(f"🎯 Target monitor started — enabled={TARGET_ENABLED}, "
+             f"target=₹{_target_value}, poll={TARGET_POLL_SEC}s, file={TARGET_FILE}")
+    while True:
+        try:
+            time.sleep(TARGET_POLL_SEC)
+            if not TARGET_ENABLED:
+                continue
+            if _target_value is None or _target_value <= 0:
+                continue  # disabled until target set
+            current, wallet, unrealized = fetch_real_current_value()
+            _target_last_check_at = datetime.now(timezone.utc).isoformat()
+            if current is None:
+                _target_last_error = "fetch failed"
+                continue
+            _target_last_value = current
+            _target_last_error = None
+            # State transition: not hit -> hit
+            if not _target_hit and current >= _target_value:
+                _target_hit = True
+                _target_hit_at = datetime.now(timezone.utc).isoformat()
+                save_target_state()
+                log.info(f"🎯 TARGET HIT: current=₹{current:.2f} (wallet=₹{wallet:.2f} "
+                         f"+ unrealized=₹{unrealized:+.2f}) >= target=₹{_target_value:.2f} — "
+                         f"new entries/reverses will be rejected")
+        except Exception as e:
+            _target_last_error = str(e)
+            log.error(f"target_worker error: {e}", exc_info=True)
+
 
 # ─── Event Log ───
 trade_log = []
@@ -801,6 +971,23 @@ def webhook():
                 return jsonify({"status": "rejected",
                                 "reason": f"SL lockout on {symbol} ({remaining}s)"}), 200
 
+        # ─── TARGET CURRENT VALUE GATE ────────────────────────
+        # If wallet equity has hit TARGET_CURRENT_VALUE, reject all new
+        # entries and reverses. Books and closes still pass through so
+        # existing positions can resolve cleanly. Trading resumes only
+        # when /target/set is called with a higher value (or /target/clear
+        # is called explicitly).
+        if TARGET_ENABLED and _target_hit and alert_type in ("entry", "reverse"):
+            cur = _target_last_value
+            cur_str = f"₹{cur:.2f}" if cur is not None else "unknown"
+            log.info(f"🎯 TARGET HIT: rejecting {alert_type} for {symbol} — "
+                     f"current={cur_str} >= target=₹{_target_value:.2f}")
+            log_trade_event(symbol, action, alert_type, "TARGET_HIT",
+                            f"current={cur_str} target=₹{_target_value:.2f}")
+            return jsonify({"status": "rejected",
+                            "reason": f"target ₹{_target_value:.2f} reached "
+                                      f"(current={cur_str})"}), 200
+
         # ─── ENTRY — initial position ─────────────────────────
         if alert_type == "entry":
             if symbol in active_trades:
@@ -1245,6 +1432,85 @@ def sl_lockout_clear():
 
 
 # ═══════════════════════════════════════════════════════════
+#  TARGET CURRENT VALUE ENDPOINTS
+# ═══════════════════════════════════════════════════════════
+@app.route("/target/status", methods=["GET"])
+def target_status():
+    """Public read-only status of the target system. Includes the most
+    recent computed current_value (from the worker's last poll), so this
+    is also a quick way to see real wallet equity."""
+    return jsonify({
+        "enabled": TARGET_ENABLED,
+        "target_value": _target_value,
+        "hit": _target_hit,
+        "hit_at": _target_hit_at,
+        "last_current_value": _target_last_value,
+        "last_check_at": _target_last_check_at,
+        "last_error": _target_last_error,
+        "poll_sec": TARGET_POLL_SEC,
+        "distance_to_target": (
+            None if _target_last_value is None or _target_value is None or _target_value <= 0
+            else round(_target_value - _target_last_value, 2)
+        ),
+    }), 200
+
+
+@app.route("/target/set", methods=["POST", "GET"])
+def target_set():
+    """Set or update the target value. If the new value is above the
+    current wallet value, the hit flag is cleared and trading resumes.
+    Requires ?value=N&secret=... ."""
+    global _target_value, _target_hit, _target_hit_at
+    if WEBHOOK_SECRET and request.args.get("secret") != WEBHOOK_SECRET:
+        return jsonify({"error": "unauthorized"}), 401
+    raw = request.args.get("value")
+    if raw is None:
+        return jsonify({"error": "value required, e.g. /target/set?value=2400&secret=..."}), 400
+    try:
+        new_value = float(raw)
+    except ValueError:
+        return jsonify({"error": f"value must be numeric, got: {raw}"}), 400
+    if new_value < 0:
+        return jsonify({"error": "value must be >= 0 (use 0 to disable)"}), 400
+    old_value = _target_value
+    old_hit   = _target_hit
+    _target_value = new_value
+    # If the new target is strictly above current measured value (or current
+    # is unknown), clear the hit flag so trading can resume.
+    cur = _target_last_value
+    if cur is None or new_value > cur:
+        _target_hit = False
+        _target_hit_at = None
+    save_target_state()
+    log.info(f"🎯 TARGET SET: ₹{old_value} -> ₹{new_value} | "
+             f"hit: {old_hit} -> {_target_hit} | "
+             f"current={'₹{:.2f}'.format(cur) if cur is not None else 'unknown'}")
+    return jsonify({
+        "status": "ok",
+        "old_value": old_value,
+        "new_value": new_value,
+        "hit": _target_hit,
+        "last_current_value": cur,
+    }), 200
+
+
+@app.route("/target/clear", methods=["POST", "GET"])
+def target_clear():
+    """Disable the target system entirely (sets value to 0, clears hit flag).
+    Requires ?secret=... ."""
+    global _target_value, _target_hit, _target_hit_at
+    if WEBHOOK_SECRET and request.args.get("secret") != WEBHOOK_SECRET:
+        return jsonify({"error": "unauthorized"}), 401
+    old_value = _target_value
+    _target_value = 0.0
+    _target_hit = False
+    _target_hit_at = None
+    save_target_state()
+    log.info(f"🎯 TARGET CLEARED: was ₹{old_value} -> 0 (disabled)")
+    return jsonify({"status": "ok", "old_value": old_value, "new_value": 0.0}), 200
+
+
+# ═══════════════════════════════════════════════════════════
 #  BASELINE ENDPOINTS
 # ═══════════════════════════════════════════════════════════
 @app.route("/baseline/status", methods=["GET"])
@@ -1365,6 +1631,17 @@ _baseline_thread.start()
 # Start the SL lockout monitor thread (unconditional — self-gates on SL_LOCKOUT_ENABLED).
 _sl_lockout_thread = threading.Thread(target=sl_lockout_worker, daemon=True)
 _sl_lockout_thread.start()
+
+# Load target state from disk (persists across redeploys if volume mounted)
+load_target_state()
+log.info(f"🎯 Target initialized — enabled={TARGET_ENABLED}, "
+         f"value=₹{_target_value}, hit={_target_hit}, poll={TARGET_POLL_SEC}s")
+
+# Start the target monitor thread (unconditional — self-gates on TARGET_ENABLED
+# and on _target_value > 0). Polls CoinDCX wallet+positions endpoints directly,
+# so it's orphan-proof.
+_target_thread = threading.Thread(target=target_worker, daemon=True)
+_target_thread.start()
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
