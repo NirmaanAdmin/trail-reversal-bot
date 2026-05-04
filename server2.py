@@ -266,12 +266,13 @@ def sl_lockout_worker():
 # ═══════════════════════════════════════════════════════════
 #  TARGET CURRENT VALUE — wallet-based hard stop
 #
-#  Polls CoinDCX wallet + positions every TARGET_POLL_SEC. Computes the
-#  same "Current value" that CoinDCX UI shows: wallet (Available + Locked)
-#  + sum of unrealized P&L across ALL positions (orphan-proof — queries
-#  CoinDCX directly, doesn't rely on active_trades dict).
+#  Polls CoinDCX wallet endpoint every TARGET_POLL_SEC. Computes the
+#  real wallet balance (Available + Locked margin) — NO unrealized P&L.
+#  This means the trigger fires when actually-banked money crosses target,
+#  not when paper P&L crosses target. More conservative and more predictable
+#  than including unrealized (which lags due to mark price API drift).
 #
-#  When current_value >= TARGET_CURRENT_VALUE, a flag flips and entry/reverse
+#  When wallet_balance >= TARGET_CURRENT_VALUE, a flag flips and entry/reverse
 #  webhooks are rejected. Books and closes still pass through so existing
 #  positions can resolve. To resume trading, set a new (higher) target via
 #  /target/set?value=N&secret=... — this clears the hit flag.
@@ -388,13 +389,19 @@ def save_target_state():
 
 
 def target_worker():
-    """Background thread: every TARGET_POLL_SEC, fetches real wallet + positions
-    from CoinDCX, computes current value, and flips _target_hit if target reached.
-    Self-gates on TARGET_ENABLED and _target_value > 0 so it can be paused via
-    env var or by clearing the target."""
+    """Background thread: every TARGET_POLL_SEC, fetches real wallet balance
+    (Available + Locked, INR) from CoinDCX and flips _target_hit if wallet
+    reaches target. Self-gates on TARGET_ENABLED and _target_value > 0 so
+    it can be paused via env var or by clearing the target.
+
+    WALLET-ONLY MODE: this looks at realized money in your wallet, NOT
+    floating unrealized P&L. Trigger fires when actually-banked profit
+    crosses target. This avoids the mark-price API drift that affected
+    the earlier wallet+unrealized implementation."""
     global _target_hit, _target_hit_at, _target_last_value, _target_last_check_at, _target_last_error
     log.info(f"🎯 Target monitor started — enabled={TARGET_ENABLED}, "
-             f"target=₹{_target_value}, poll={TARGET_POLL_SEC}s, file={TARGET_FILE}")
+             f"target=₹{_target_value}, poll={TARGET_POLL_SEC}s, "
+             f"mode=wallet-only, file={TARGET_FILE}")
     while True:
         try:
             time.sleep(TARGET_POLL_SEC)
@@ -402,20 +409,20 @@ def target_worker():
                 continue
             if _target_value is None or _target_value <= 0:
                 continue  # disabled until target set
-            current, wallet, unrealized = fetch_real_current_value()
+            wallet = fetch_real_wallet_inr()
             _target_last_check_at = datetime.now(timezone.utc).isoformat()
-            if current is None:
-                _target_last_error = "fetch failed"
+            if wallet is None:
+                _target_last_error = "wallet fetch failed"
                 continue
-            _target_last_value = current
+            _target_last_value = wallet
             _target_last_error = None
             # State transition: not hit -> hit
-            if not _target_hit and current >= _target_value:
+            if not _target_hit and wallet >= _target_value:
                 _target_hit = True
                 _target_hit_at = datetime.now(timezone.utc).isoformat()
                 save_target_state()
-                log.info(f"🎯 TARGET HIT: current=₹{current:.2f} (wallet=₹{wallet:.2f} "
-                         f"+ unrealized=₹{unrealized:+.2f}) >= target=₹{_target_value:.2f} — "
+                log.info(f"🎯 TARGET HIT: wallet=₹{wallet:.2f} >= "
+                         f"target=₹{_target_value:.2f} — "
                          f"new entries/reverses will be rejected")
         except Exception as e:
             _target_last_error = str(e)
