@@ -123,6 +123,34 @@ def tick_round_sl(sl_price, entry_price, side, symbol):
 #           order_id, tp_price, sl_price, books_done, leverage, margin_ccy}}
 active_trades = {}
 
+# ─── Persist active_trades across container restarts ──────────
+# Without this, a Railway restart wipes the in-memory dict and orphans
+# any open positions on CoinDCX (profit-lock can't see them, books fail
+# to match). Saves on every set/clear/book/close-all. Loads on startup.
+ACTIVE_TRADES_FILE = os.environ.get("ACTIVE_TRADES_FILE", "/app/data/active_trades.json")
+
+def _save_active_trades():
+    try:
+        os.makedirs(os.path.dirname(ACTIVE_TRADES_FILE), exist_ok=True)
+        with open(ACTIVE_TRADES_FILE, "w") as f:
+            json.dump(active_trades, f)
+    except Exception as e:
+        log.warning(f"⚠️ Failed to persist active_trades: {e}")
+
+def _load_active_trades():
+    try:
+        with open(ACTIVE_TRADES_FILE) as f:
+            data = json.load(f)
+        active_trades.update(data)
+        if data:
+            log.info(f"📂 Restored {len(data)} active trade(s) from disk: {list(data.keys())}")
+        else:
+            log.info("📂 active_trades file empty — starting fresh")
+    except FileNotFoundError:
+        log.info(f"📂 No active_trades file at {ACTIVE_TRADES_FILE} — starting fresh")
+    except Exception as e:
+        log.warning(f"⚠️ Failed to load active_trades ({e}) — starting fresh")
+
 # ═══════════════════════════════════════════════════════════
 #  AUTO PROFIT-LOCK — close all positions when net ROE ≥ threshold
 # ═══════════════════════════════════════════════════════════
@@ -614,6 +642,7 @@ def close_all_positions(trigger_reason="profit lock", trigger_pct=None):
         except Exception:
             pass
     active_trades.clear()
+    _save_active_trades()
     _profit_lock_until = time.time() + COOLDOWN_AFTER_LOCK_SEC
     cooldown_end = datetime.fromtimestamp(_profit_lock_until).strftime("%H:%M:%S")
     log.info(f"✅ PROFIT LOCK complete — all positions closed, cooldown until {cooldown_end}")
@@ -847,12 +876,14 @@ def set_active_trade(pair, side, qty, entry_price, order_id, tp_price=None, sl_p
         "books_done": 0, "leverage": leverage, "margin_ccy": margin_ccy
     }
     log.info(f"📝 Tracked: {side.upper()} {qty} {pair} @ {entry_price} | TP={tp_price} SL={sl_price}")
+    _save_active_trades()
 
 def clear_active_trade(pair, reason=""):
     old = active_trades.pop(pair, None)
     if old:
         cancel_native_sl(pair)
         log.info(f"🔓 Cleared: {pair} — {reason}")
+        _save_active_trades()
 
 def calc_quantity(coin_price, leverage):
     if FIXED_MARGIN_INR <= 0:
@@ -1079,6 +1110,7 @@ def webhook():
                 trade["tp_price"] = tp_price
             if sl_price:
                 trade["sl_price"] = sl_price
+            _save_active_trades()
 
             # Record realized P&L for baseline tracking (partial book)
             baseline_record_realized_pnl(
@@ -1406,6 +1438,7 @@ def clear_lock():
             cancel_native_sl(sym)
         count = len(active_trades)
         active_trades.clear()
+        _save_active_trades()
         return jsonify({"status": "ok", "cleared": count})
 
 
@@ -1628,6 +1661,7 @@ def health():
 
 # ─── Startup ──────────────────────────────────────────────────
 load_tick_sizes()
+_load_active_trades()
 log.info("🤖 Trail TP/SL Rev Bot ready — Pine-driven bookings + native SL")
 
 # Initialize daily-cap counter for today's IST date
