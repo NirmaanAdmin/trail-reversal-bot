@@ -1180,8 +1180,16 @@ def webhook():
                     mark_sl_lockout(symbol, reason="Pine sl_wait close on tracked position")
                 else:
                     log.info(f"⏳ SL-WAIT for {symbol} ignored for lockout — not in active_trades")
+            elif reason == "tp_hit":
+                log.info(f"✓ TP HIT: {symbol} — return={ret_pct}%")
+            elif reason == "sl_hit":
+                log.info(f"✗ SL HIT: {symbol} — return={ret_pct}%")
+            elif reason == "timer_expired":
+                log.info(f"⏱ TIMER EXIT: {symbol} — return={ret_pct}%")
+            elif reason == "kill_switch":
+                log.info(f"☠️ KILL SWITCH: {symbol} — return={ret_pct}%")
             else:
-                log.info(f"☠️ KILL SWITCH: {symbol} — reason={reason}, return={ret_pct}%")
+                log.info(f"☠️ CLOSE ({reason}): {symbol} — return={ret_pct}%")
 
             cancel_native_sl(symbol)
 
@@ -1191,7 +1199,14 @@ def webhook():
                 close_side = "sell" if trade["side"] == "buy" else "buy"
 
                 if close_qty > 0:
-                    log.info(f"🔻 {('SL-WAIT' if reason == 'sl_wait' else 'KILL')} close: "
+                    reason_label = {
+                        "sl_wait": "SL-WAIT",
+                        "tp_hit": "TP",
+                        "sl_hit": "SL",
+                        "timer_expired": "TIMER",
+                        "kill_switch": "KILL",
+                    }.get(reason, reason.upper())
+                    log.info(f"🔻 {reason_label} close: "
                              f"{close_side.upper()} {close_qty} {symbol}")
                     result = client.place_order(
                         pair=symbol, side=close_side, order_type="market_order",
@@ -1213,13 +1228,13 @@ def webhook():
 
                 clear_active_trade(symbol, f"{reason}")
                 log_trade_event(symbol, close_side,
-                                "sl_wait" if reason == "sl_wait" else "kill",
+                                reason if reason in ("sl_wait", "tp_hit", "sl_hit", "timer_expired", "kill_switch") else "close",
                                 "FILLED",
                                 f"reason={reason}")
             else:
                 log.info(f"⚠️ Close for {symbol} but not tracked — no action needed")
                 log_trade_event(symbol, action,
-                                "sl_wait" if reason == "sl_wait" else "kill",
+                                reason if reason in ("sl_wait", "tp_hit", "sl_hit", "timer_expired", "kill_switch") else "close",
                                 "SKIP", "not tracked")
 
             return jsonify({"status": "closed", "symbol": symbol, "reason": reason}), 200
