@@ -1427,19 +1427,70 @@ def stats():
         "time": datetime.now().isoformat()
     })
 
-@app.route("/clear-lock", methods=["POST", "GET"])
+@app.route("/clear-lock", methods=["POST"])
 def clear_lock():
+    """Clear bot's tracking for a single symbol. POST only — GET is intentionally
+    rejected because browsers re-fire GET requests on tab reloads, bookmarks, and
+    history restoration, which previously caused silent mass-clears. The symbol
+    parameter is required; clearing all symbols at once is no longer supported
+    via this endpoint (it used to also cancel every native SL on CoinDCX as a
+    side effect, leaving positions naked). To reset everything, hit this endpoint
+    once per symbol explicitly."""
+    symbol = request.args.get("symbol") or (request.get_json(silent=True) or {}).get("symbol")
+    if not symbol:
+        return jsonify({
+            "status": "error",
+            "reason": "symbol required — pass ?symbol=B-XYZ_USDT. Mass-clear is no longer supported."
+        }), 400
+    was_tracked = symbol in active_trades
+    clear_active_trade(symbol, "manual clear via /clear-lock")
+    log.info(f"🧹 /clear-lock invoked for {symbol} (was_tracked={was_tracked})")
+    return jsonify({"status": "ok", "cleared": symbol, "was_tracked": was_tracked})
+
+
+@app.route("/clear-tracking", methods=["GET", "POST"])
+def clear_tracking():
+    """URL-friendly version of clear-lock for use from phone bookmarks.
+    Accepts GET (so it works from any browser address bar) but is hardened in
+    four ways to make accidental tab-reloads safe:
+      1. Requires ?secret= matching WEBHOOK_SECRET — random URL discovery fails
+      2. Requires ?symbol= — never mass-clears, only ever affects one symbol
+      3. Idempotent — re-firing on an already-cleared symbol is a no-op
+      4. By default does NOT cancel native SL on CoinDCX (the dangerous side
+         effect that left positions naked). Pass ?cancel_sl=true to opt in.
+
+    Example URL (bookmarkable on phone):
+      https://your-app.up.railway.app/clear-tracking?secret=YOUR_SECRET&symbol=B-ORDI_USDT
+
+    Tab-reload damage scope: at worst, ONE symbol's bot tracking is cleared.
+    Native SL on CoinDCX continues to protect the position. The bot will pick
+    up the symbol again on the next Pine entry alert."""
+    if WEBHOOK_SECRET and request.args.get("secret") != WEBHOOK_SECRET:
+        return jsonify({"status": "error", "reason": "invalid or missing secret"}), 403
     symbol = request.args.get("symbol")
-    if symbol:
-        clear_active_trade(symbol, "manual clear")
-        return jsonify({"status": "ok", "cleared": symbol})
-    else:
-        for sym in list(native_sl_orders.keys()):
-            cancel_native_sl(sym)
-        count = len(active_trades)
-        active_trades.clear()
+    if not symbol:
+        return jsonify({"status": "error", "reason": "symbol required (e.g. ?symbol=B-ORDI_USDT)"}), 400
+
+    was_tracked = symbol in active_trades
+    cancel_sl = request.args.get("cancel_sl", "").lower() == "true"
+
+    if was_tracked:
+        active_trades.pop(symbol, None)
         _save_active_trades()
-        return jsonify({"status": "ok", "cleared": count})
+        if cancel_sl:
+            cancel_native_sl(symbol)
+            log.info(f"🧹 /clear-tracking: {symbol} — cleared tracking + canceled native SL")
+        else:
+            log.info(f"🧹 /clear-tracking: {symbol} — cleared tracking only (native SL preserved)")
+    else:
+        log.info(f"🧹 /clear-tracking: {symbol} — no-op (not currently tracked)")
+
+    return jsonify({
+        "status": "ok",
+        "symbol": symbol,
+        "was_tracked": was_tracked,
+        "sl_canceled": cancel_sl and was_tracked
+    })
 
 
 # ═══════════════════════════════════════════════════════════
