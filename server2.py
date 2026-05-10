@@ -88,7 +88,25 @@ def round_up_to_tick(price, tick_size):
     decimals = max(0, -math.floor(math.log10(tick_size)))
     return round(math.ceil(price / tick_size) * tick_size, decimals)
 
-def round_down_quantity(qty, price):
+def round_down_quantity(qty, price, symbol=None):
+    """Round qty DOWN to CoinDCX's allowed precision.
+
+    When `symbol` is provided, uses the cached `base_currency_precision` from
+    /markets_details — the exchange-defined quantity step. This is the correct
+    behavior and what callers should always do.
+
+    Falls back to a price-based heuristic only when the cache miss happens
+    (symbol unknown or cache empty). The heuristic is conservative — at
+    price ≥ 10 it rounds to 1 decimal, which over-rounds for many coins
+    (e.g., 0.198 → 0.1) and was the cause of the GIGGLE book failure with
+    'Minimum order value 588 INR' on 2026-05-10.
+    """
+    if symbol:
+        step = get_tick_size(symbol)
+        if step and step > 0:
+            decimals = max(0, -math.floor(math.log10(step)))
+            return round(math.floor(qty / step) * step, decimals)
+    # Fallback heuristic — used only when symbol-specific step is unavailable
     if price >= 1000:
         return math.floor(qty * 1000) / 1000
     elif price >= 100:
@@ -885,12 +903,12 @@ def clear_active_trade(pair, reason=""):
         log.info(f"🔓 Cleared: {pair} — {reason}")
         _save_active_trades()
 
-def calc_quantity(coin_price, leverage):
+def calc_quantity(coin_price, leverage, symbol=None):
     if FIXED_MARGIN_INR <= 0:
         return 0
     available_usdt = (FIXED_MARGIN_INR * WALLET_USAGE_PCT) / USDT_INR_RATE
     raw_qty = (available_usdt * leverage) / coin_price
-    return round_down_quantity(raw_qty, coin_price)
+    return round_down_quantity(raw_qty, coin_price, symbol=symbol)
 
 
 # ═══════════════════════════════════════════════════════════
@@ -1035,7 +1053,7 @@ def webhook():
                 log_trade_event(symbol, action, "entry", "SKIP", f"already active ({mins}m)")
                 return jsonify({"status": "skipped", "reason": "already active"}), 200
 
-            quantity = calc_quantity(coin_price, leverage)
+            quantity = calc_quantity(coin_price, leverage, symbol=symbol)
             if quantity <= 0:
                 log.error(f"❌ REJECT: {symbol} — qty=0")
                 log_trade_event(symbol, action, "entry", "REJECT", "qty=0")
@@ -1075,7 +1093,7 @@ def webhook():
                 return jsonify({"status": "skipped"}), 200
 
             trade = active_trades[symbol]
-            book_qty = round_down_quantity(trade["original_qty"] * book_pct, coin_price)
+            book_qty = round_down_quantity(trade["original_qty"] * book_pct, coin_price, symbol=symbol)
             book_qty = min(book_qty, trade["qty"])
 
             if book_qty <= 0:
@@ -1166,7 +1184,7 @@ def webhook():
 
             time.sleep(1)
 
-            quantity = calc_quantity(coin_price, leverage)
+            quantity = calc_quantity(coin_price, leverage, symbol=symbol)
             if quantity <= 0:
                 log.error(f"❌ REJECT reverse entry: {symbol} — qty=0")
                 return jsonify({"status": "rejected", "reason": "reverse entry qty=0"}), 200
