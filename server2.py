@@ -1,6 +1,7 @@
 import os
 import json
 import math
+import re
 import time
 import logging
 import threading
@@ -110,6 +111,82 @@ def get_qty_step(symbol):
     if time.time() - tick_cache_time > TICK_CACHE_TTL or not qty_step_cache:
         load_tick_sizes()
     return qty_step_cache.get(symbol)
+
+
+# ─── Step-aware order placement with self-healing retry ──────
+# /markets_details is a SPOT endpoint, but Pine sends FUTURES pairs (B-*).
+# For coins where futures step ≠ spot step (e.g. B-ONDO_USDT futures uses 0.1
+# while KC-ONDO_USDT spot uses 0.0001), the cache loaded at startup will be
+# wrong and CoinDCX rejects the order with:
+#   {"code":400,"message":"Quantity should be divisible by 0.1","status":"error"}
+#
+# Strategy: parse the required step out of that error, learn it into
+# qty_step_cache (so the next entry on that symbol is correct without
+# a round-trip), re-round the qty, and retry the order ONCE.
+DIVISIBILITY_PATTERN = re.compile(r'divisible\s+by\s+([\d.]+)', re.IGNORECASE)
+
+def _parse_step_from_error(err):
+    """Extract the required step from a CoinDCX 'divisible by X' error.
+    Returns float step or None if not parseable."""
+    if not err:
+        return None
+    s = err if isinstance(err, str) else str(err)
+    m = DIVISIBILITY_PATTERN.search(s)
+    if not m:
+        return None
+    try:
+        v = float(m.group(1))
+        return v if v > 0 else None
+    except (TypeError, ValueError):
+        return None
+
+
+def place_order_step_aware(pair, side, qty, price, leverage, margin_ccy, label="order"):
+    """Place a market order, self-correcting qty on divisibility rejection.
+
+    Flow:
+      1. Send the order with caller's qty.
+      2. If CoinDCX returns 'Quantity should be divisible by X', parse X,
+         update qty_step_cache[pair]=X, re-round qty DOWN to X, retry ONCE.
+      3. Return (result_dict, final_qty_used). On any non-divisibility error
+         (insufficient funds, min notional, etc.) returns the original result.
+
+    Robust against /markets_details disagreeing with futures rules. After the
+    first reject for a given pair, the learned step persists in qty_step_cache
+    and subsequent entries on that pair use it directly (no retry needed).
+    """
+    result = client.place_order(
+        pair=pair, side=side, order_type="market_order",
+        total_quantity=qty, leverage=leverage, margin_currency=margin_ccy
+    )
+    if not (isinstance(result, dict) and result.get("status") == "error"):
+        return result, qty
+
+    err_msg = result.get("message", "") or ""
+    learned = _parse_step_from_error(err_msg)
+    if learned is None:
+        return result, qty  # different kind of error — bubble up unchanged
+
+    old = qty_step_cache.get(pair)
+    qty_step_cache[pair] = learned
+    log.info(f"🧠 Learned step from CoinDCX reject: {pair} step={learned} "
+             f"(was cached as {old}) — retrying {label}")
+
+    new_qty = round_down_quantity(qty, price, symbol=pair)
+    if new_qty <= 0:
+        log.warning(f"⚠️ Retry skipped — re-rounded qty {new_qty} ≤ 0 for {pair}")
+        return result, qty
+    if abs(new_qty - qty) < 1e-12:
+        log.warning(f"⚠️ Retry skipped — re-rounded qty unchanged ({qty}) for {pair}")
+        return result, qty
+
+    log.info(f"🔁 Retry {label}: {side.upper()} {new_qty} {pair} (was {qty})")
+    retry_result = client.place_order(
+        pair=pair, side=side, order_type="market_order",
+        total_quantity=new_qty, leverage=leverage, margin_currency=margin_ccy
+    )
+    return retry_result, new_qty
+
 
 def round_to_tick(price, tick_size):
     if tick_size is None or tick_size <= 0:
@@ -1096,10 +1173,9 @@ def webhook():
                 return jsonify({"status": "rejected", "reason": "qty=0"}), 200
 
             log.info(f"🚀 ENTRY {action.upper()} {quantity} {symbol} ({leverage}x) | TP={tp_price} SL={sl_price}")
-            result = client.place_order(
-                pair=symbol, side=action, order_type="market_order",
-                total_quantity=quantity, leverage=leverage,
-                margin_currency=margin_ccy
+            result, quantity = place_order_step_aware(
+                pair=symbol, side=action, qty=quantity, price=coin_price,
+                leverage=leverage, margin_ccy=margin_ccy, label="entry"
             )
 
             if isinstance(result, dict) and result.get("status") == "error":
@@ -1226,10 +1302,9 @@ def webhook():
                 return jsonify({"status": "rejected", "reason": "reverse entry qty=0"}), 200
 
             log.info(f"🔄 REVERSE entry: {action.upper()} {quantity} {symbol} | TP={tp_price} SL={sl_price}")
-            result = client.place_order(
-                pair=symbol, side=action, order_type="market_order",
-                total_quantity=quantity, leverage=leverage,
-                margin_currency=margin_ccy
+            result, quantity = place_order_step_aware(
+                pair=symbol, side=action, qty=quantity, price=coin_price,
+                leverage=leverage, margin_ccy=margin_ccy, label="reverse_entry"
             )
 
             if isinstance(result, dict) and result.get("status") == "error":
