@@ -43,30 +43,56 @@ def _signed_get(endpoint, body=None):
     headers = {"Content-Type": "application/json", "X-AUTH-APIKEY": API_KEY, "X-AUTH-SIGNATURE": sig}
     return _req.get(f"https://api.coindcx.com{endpoint}", data=json_body, headers=headers, timeout=15)
 
-# ─── Tick Size Cache ──────────────────────────────────────────
+# ─── Tick Size Caches ──────────────────────────────────────────
+# tick_cache:     price tick from base_currency_precision (used for SL/price rounding)
+# qty_step_cache: quantity step from the `step` field (used for order qty rounding)
+# These are TWO DIFFERENT precisions in CoinDCX's API and must not be conflated.
 tick_cache = {}
+qty_step_cache = {}
 tick_cache_time = 0
 TICK_CACHE_TTL = 3600
 
 def load_tick_sizes():
-    global tick_cache, tick_cache_time
+    global tick_cache, qty_step_cache, tick_cache_time
     try:
         resp = _req.get("https://api.coindcx.com/exchange/v1/markets_details", timeout=15)
         data = resp.json()
         for m in data:
             pair = m.get("pair", "")
             prec = m.get("base_currency_precision")
-            if prec is None:
-                continue
-            tick = 10 ** (-int(prec))
-            if pair.startswith("B-"):
-                tick_cache[pair] = tick
-            elif pair.startswith("KC-") and pair.endswith("_USDT"):
-                b_pair = "B-" + pair[3:]
-                if b_pair not in tick_cache:
-                    tick_cache[b_pair] = tick
+            step = m.get("step")
+
+            # Price tick (from base_currency_precision) — for SL/price rounding
+            if prec is not None:
+                try:
+                    tick = 10 ** (-int(prec))
+                    if pair.startswith("B-"):
+                        tick_cache[pair] = tick
+                    elif pair.startswith("KC-") and pair.endswith("_USDT"):
+                        b_pair = "B-" + pair[3:]
+                        if b_pair not in tick_cache:
+                            tick_cache[b_pair] = tick
+                except (TypeError, ValueError):
+                    pass
+
+            # Quantity step (from `step` field) — for order qty rounding
+            # This is the SEPARATE precision rule CoinDCX enforces on quantity:
+            # e.g. WLD has step=1.0 (whole numbers) even though base_precision suggests 4 decimals.
+            if step is not None:
+                try:
+                    step_f = float(step)
+                    if step_f > 0:
+                        if pair.startswith("B-"):
+                            qty_step_cache[pair] = step_f
+                        elif pair.startswith("KC-") and pair.endswith("_USDT"):
+                            b_pair = "B-" + pair[3:]
+                            if b_pair not in qty_step_cache:
+                                qty_step_cache[b_pair] = step_f
+                except (TypeError, ValueError):
+                    pass
+
         tick_cache_time = time.time()
-        log.info(f"📊 Loaded tick sizes for {len(tick_cache)} futures pairs")
+        log.info(f"📊 Loaded price ticks for {len(tick_cache)} pairs, qty steps for {len(qty_step_cache)} pairs")
     except Exception as e:
         log.error(f"❌ Failed to load tick sizes: {e}")
 
@@ -75,6 +101,15 @@ def get_tick_size(symbol):
     if time.time() - tick_cache_time > TICK_CACHE_TTL or not tick_cache:
         load_tick_sizes()
     return tick_cache.get(symbol)
+
+def get_qty_step(symbol):
+    """Return the minimum quantity increment for `symbol` (e.g. 1.0 for WLD, 0.1 for HEMI).
+    Reads the `step` field from CoinDCX's /markets_details — this is the value
+    the exchange enforces on order quantity (not base_currency_precision)."""
+    global tick_cache_time
+    if time.time() - tick_cache_time > TICK_CACHE_TTL or not qty_step_cache:
+        load_tick_sizes()
+    return qty_step_cache.get(symbol)
 
 def round_to_tick(price, tick_size):
     if tick_size is None or tick_size <= 0:
@@ -89,20 +124,21 @@ def round_up_to_tick(price, tick_size):
     return round(math.ceil(price / tick_size) * tick_size, decimals)
 
 def round_down_quantity(qty, price, symbol=None):
-    """Round qty DOWN to CoinDCX's allowed precision.
+    """Round qty DOWN to CoinDCX's allowed quantity step.
 
-    When `symbol` is provided, uses the cached `base_currency_precision` from
-    /markets_details — the exchange-defined quantity step. This is the correct
-    behavior and what callers should always do.
+    When `symbol` is provided, uses the `step` field from /markets_details
+    (the exchange-enforced quantity increment). Examples:
+      - B-WLD_USDT: step=1.0   → 80.8421 floors to 80
+      - B-HEMI_USDT: step=0.1  → 1234.567 floors to 1234.5
+      - B-MANTRA_USDT: step=1.0 → whole numbers only
 
-    Falls back to a price-based heuristic only when the cache miss happens
-    (symbol unknown or cache empty). The heuristic is conservative — at
-    price ≥ 10 it rounds to 1 decimal, which over-rounds for many coins
-    (e.g., 0.198 → 0.1) and was the cause of the GIGGLE book failure with
-    'Minimum order value 588 INR' on 2026-05-10.
+    Falls back to a price-based heuristic only on cache miss. The heuristic
+    is conservative — at price ≥ 10 it rounds to 1 decimal, which over-rounds
+    for many coins (e.g. 0.198 → 0.1) and was the cause of the GIGGLE book
+    failure with 'Minimum order value 588 INR' on 2026-05-10.
     """
     if symbol:
-        step = get_tick_size(symbol)
+        step = get_qty_step(symbol)
         if step and step > 0:
             decimals = max(0, -math.floor(math.log10(step)))
             return round(math.floor(qty / step) * step, decimals)
