@@ -306,6 +306,32 @@ _profit_lock_until = 0.0   # epoch timestamp; webhooks restricted until this
 _ticker_cache = {}          # {symbol: (price, fetched_at)}
 
 # ═══════════════════════════════════════════════════════════
+#  AUTO LOSS-LOCK — close all positions when net ROE ≤ -threshold
+# ═══════════════════════════════════════════════════════════
+# Mirror of the profit-lock, on the loss side. When net ROE across all
+# active positions reaches -LOSS_LOCK_PCT (e.g. -6%), the monitor thread:
+#   1. closes every position in active_trades via market order
+#   2. clears active_trades
+#   3. activates a cooldown window that rejects every webhook except fresh
+#      'entry' alerts, for LOSS_LOCK_COOLDOWN_SEC seconds
+#
+# Independent of the profit-lock cooldown and the daily-cap counter:
+#   • A loss-lock has its OWN cooldown variable (_loss_lock_until). Either
+#     cooldown active rejects webhooks, but they expire on their own clocks.
+#   • Loss-lock triggers do NOT contribute to the daily cap counter
+#     (daily cap is for cumulative locked PROFIT only — adding negative
+#     numbers would falsely extend the daily profit budget).
+#
+# Reuses POLL_INTERVAL_SEC from profit-lock — same monitor cadence is fine.
+# Reuses compute_net_roe() — same math, opposite sign comparison.
+LOSS_LOCK_ENABLED          = os.environ.get("LOSS_LOCK_ENABLED", "false").lower() == "true"
+LOSS_LOCK_PCT              = float(os.environ.get("LOSS_LOCK_PCT", "6.0"))
+LOSS_LOCK_COOLDOWN_SEC     = int(os.environ.get("LOSS_LOCK_COOLDOWN_SEC", "300"))
+
+# Shared state — separate from profit-lock so each can fire independently
+_loss_lock_until = 0.0   # epoch timestamp; webhooks restricted until this
+
+# ═══════════════════════════════════════════════════════════
 #  DAILY PROFIT CAP — hard stop after N% cumulative locked
 # ═══════════════════════════════════════════════════════════
 # Tracks cumulative profit-lock %s captured across the day. When the sum
@@ -741,13 +767,26 @@ def daily_cap_active():
     return DAILY_CAP_ENABLED and _daily_paused
 
 
-def close_all_positions(trigger_reason="profit lock", trigger_pct=None):
+def close_all_positions(trigger_reason="profit lock", trigger_pct=None, lock_type="profit"):
     """Close every position in active_trades via market order, clear state,
     cancel any native SLs, and activate the post-lock cooldown.
-    If trigger_pct is provided, also bumps the daily cumulative counter."""
-    global _profit_lock_until
+
+    lock_type controls which cooldown clock gets armed and whether the daily
+    cap counter is bumped:
+      "profit"  → arms _profit_lock_until,
+                  bumps _daily_locked_pct_sum if trigger_pct is not None
+      "loss"    → arms _loss_lock_until,
+                  never bumps the daily counter (daily cap is profit-only)
+
+    Both call paths emit the same "🔒 LOCK close" log line per symbol so
+    Railway logs read the same. The header/footer log lines distinguish
+    PROFIT LOCK vs LOSS LOCK so you can tell at a glance what fired.
+    """
+    global _profit_lock_until, _loss_lock_until
     snapshot = list(active_trades.items())
-    log.info(f"🔒 PROFIT LOCK triggered ({trigger_reason}) — closing {len(snapshot)} positions")
+    header_emoji = "🛑" if lock_type == "loss" else "🔒"
+    header_label = "LOSS LOCK" if lock_type == "loss" else "PROFIT LOCK"
+    log.info(f"{header_emoji} {header_label} triggered ({trigger_reason}) — closing {len(snapshot)} positions")
     for sym, trade in snapshot:
         try:
             close_qty = float(trade.get("qty", 0) or 0)
@@ -763,7 +802,9 @@ def close_all_positions(trigger_reason="profit lock", trigger_pct=None):
             )
             if isinstance(result, dict) and result.get("status") == "error":
                 log.warning(f"⚠️ Lock close failed for {sym}: {result.get('message','')}")
-            log_trade_event(sym, close_side, "profit_lock", "FILLED", trigger_reason)
+            log_trade_event(sym, close_side,
+                            "loss_lock" if lock_type == "loss" else "profit_lock",
+                            "FILLED", trigger_reason)
         except Exception as e:
             log.error(f"❌ Lock close exception for {sym}: {e}", exc_info=True)
     # Cancel native SLs, clear tracking
@@ -774,12 +815,18 @@ def close_all_positions(trigger_reason="profit lock", trigger_pct=None):
             pass
     active_trades.clear()
     _save_active_trades()
-    _profit_lock_until = time.time() + COOLDOWN_AFTER_LOCK_SEC
-    cooldown_end = datetime.fromtimestamp(_profit_lock_until).strftime("%H:%M:%S")
-    log.info(f"✅ PROFIT LOCK complete — all positions closed, cooldown until {cooldown_end}")
-    # Bump daily counter (may trip the daily cap)
-    if trigger_pct is not None:
-        _bump_daily_counter(trigger_pct)
+    # Arm the right cooldown clock and log accordingly
+    if lock_type == "loss":
+        _loss_lock_until = time.time() + LOSS_LOCK_COOLDOWN_SEC
+        cooldown_end = datetime.fromtimestamp(_loss_lock_until).strftime("%H:%M:%S")
+        log.info(f"✅ LOSS LOCK complete — all positions closed, cooldown until {cooldown_end}")
+        # Intentionally NOT bumping the daily counter for loss events
+    else:
+        _profit_lock_until = time.time() + COOLDOWN_AFTER_LOCK_SEC
+        cooldown_end = datetime.fromtimestamp(_profit_lock_until).strftime("%H:%M:%S")
+        log.info(f"✅ PROFIT LOCK complete — all positions closed, cooldown until {cooldown_end}")
+        if trigger_pct is not None:
+            _bump_daily_counter(trigger_pct)
 
 
 def profit_lock_worker():
@@ -820,6 +867,59 @@ def in_profit_lock_cooldown():
 
 def cooldown_remaining_sec():
     remaining = _profit_lock_until - time.time()
+    return max(0, int(remaining))
+
+
+# ─── LOSS-LOCK WORKER + HELPERS ───────────────────────────────────────
+def loss_lock_worker():
+    """Background thread: polls net ROE every POLL_INTERVAL_SEC; triggers
+    close-all when net% drops to ≤ -LOSS_LOCK_PCT. Skips during cooldown.
+
+    Sits alongside profit_lock_worker. The two are wired off the same
+    compute_net_roe() so they always see the same pnl/margin numbers in
+    the same cycle. Either firing arms its own cooldown clock; the webhook
+    handler rejects against both clocks (OR).
+    """
+    log.info(f"🛑 Loss-lock monitor started — threshold=-{LOSS_LOCK_PCT}%, "
+             f"poll={POLL_INTERVAL_SEC}s, cooldown={LOSS_LOCK_COOLDOWN_SEC}s, "
+             f"enabled={LOSS_LOCK_ENABLED}")
+    while True:
+        try:
+            time.sleep(POLL_INTERVAL_SEC)
+            if not LOSS_LOCK_ENABLED:
+                continue
+            # Either cooldown active → wait. Order doesn't matter, just skip.
+            if time.time() < _profit_lock_until:
+                continue
+            if time.time() < _loss_lock_until:
+                continue
+            if not active_trades:
+                continue
+            pnl, margin, pct = compute_net_roe()
+            if pct is None:
+                log.debug("loss-lock: price fetch unavailable this cycle")
+                continue
+            # Verbose log every cycle (mirrors profit-lock visibility)
+            log.info(f"🛑 loss_roe check: pnl=₹{pnl:.2f} margin=₹{margin:.2f} "
+                     f"net={pct:.2f}% (threshold=-{LOSS_LOCK_PCT}%) "
+                     f"positions={len(active_trades)}")
+            if pct <= -LOSS_LOCK_PCT:
+                close_all_positions(
+                    trigger_reason=f"net ROE {pct:.2f}% ≤ -{LOSS_LOCK_PCT}%",
+                    trigger_pct=None,     # never bump daily cap
+                    lock_type="loss"
+                )
+        except Exception as e:
+            log.error(f"loss-lock worker error: {e}", exc_info=True)
+
+
+def in_loss_lock_cooldown():
+    """Return True if we're currently in the post-loss-lock cooldown window."""
+    return time.time() < _loss_lock_until
+
+
+def loss_cooldown_remaining_sec():
+    remaining = _loss_lock_until - time.time()
     return max(0, int(remaining))
 
 
@@ -1114,6 +1214,16 @@ def webhook():
             log.info(f"🔒 COOLDOWN: rejecting {alert_type} for {symbol} — {remaining}s left")
             log_trade_event(symbol, action, alert_type, "COOLDOWN", f"{remaining}s remaining")
             return jsonify({"status": "rejected", "reason": f"profit-lock cooldown ({remaining}s)"}), 200
+
+        # ─── LOSS-LOCK COOLDOWN GATE ──────────────────────────
+        # Mirror of the profit-lock gate. After a loss-lock auto-close-all,
+        # reject ALL webhooks for LOSS_LOCK_COOLDOWN_SEC. Same rationale —
+        # let Pine flatten its internal state before we accept new trades.
+        if in_loss_lock_cooldown():
+            remaining = loss_cooldown_remaining_sec()
+            log.info(f"🛑 LOSS COOLDOWN: rejecting {alert_type} for {symbol} — {remaining}s left")
+            log_trade_event(symbol, action, alert_type, "LOSS_COOLDOWN", f"{remaining}s remaining")
+            return jsonify({"status": "rejected", "reason": f"loss-lock cooldown ({remaining}s)"}), 200
 
         # ─── BASELINE COOLDOWN GATE ───────────────────────────
         # After a baseline trigger fires, reject ENTRY and REVERSE webhooks
@@ -1429,6 +1539,13 @@ def status():
             "in_cooldown": in_profit_lock_cooldown(),
             "cooldown_remaining_sec": cooldown_remaining_sec(),
         },
+        "loss_lock": {
+            "enabled": LOSS_LOCK_ENABLED,
+            "threshold_pct": -LOSS_LOCK_PCT,
+            "current_net_pct": pct_str,
+            "in_cooldown": in_loss_lock_cooldown(),
+            "cooldown_remaining_sec": loss_cooldown_remaining_sec(),
+        },
         "daily_cap": {
             "enabled": DAILY_CAP_ENABLED,
             "cap_pct": DAILY_CAP_PCT,
@@ -1494,6 +1611,42 @@ def profit_lock_force():
                     "cooldown_remaining_sec": cooldown_remaining_sec(),
                     "daily_cumulative_pct": _daily_locked_pct_sum,
                     "daily_paused": _daily_paused})
+
+@app.route("/loss-lock/check", methods=["GET"])
+def loss_lock_check():
+    """Force a manual loss-lock check; does NOT trigger close unless threshold met.
+    Read-only diagnostic — mirrors /profit-lock/check on the negative side."""
+    pnl, margin, pct = compute_net_roe()
+    return jsonify({
+        "enabled": LOSS_LOCK_ENABLED,
+        "net_pnl_inr": pnl,
+        "total_margin_inr": margin,
+        "net_pct": pct,
+        "threshold_pct": -LOSS_LOCK_PCT,
+        "would_trigger": (pct is not None and pct <= -LOSS_LOCK_PCT),
+        "in_cooldown": in_loss_lock_cooldown(),
+        "cooldown_remaining_sec": loss_cooldown_remaining_sec(),
+    })
+
+@app.route("/loss-lock/force", methods=["POST", "GET"])
+def loss_lock_force():
+    """Manually trigger close-all-and-loss-lock (for emergencies / testing).
+    Requires ?secret=... matching WEBHOOK_SECRET. Does NOT bump the daily-cap
+    counter (consistent with the auto loss-lock — daily cap is profit-only)."""
+    if WEBHOOK_SECRET and request.args.get("secret") != WEBHOOK_SECRET:
+        return jsonify({"error": "unauthorized"}), 401
+    if not active_trades:
+        return jsonify({"status": "no_positions", "active": 0})
+    count = len(active_trades)
+    pnl, margin, pct = compute_net_roe()
+    close_all_positions(
+        trigger_reason="manual force (loss-lock)",
+        trigger_pct=None,
+        lock_type="loss"
+    )
+    return jsonify({"status": "locked", "closed": count,
+                    "trigger_pct": pct,
+                    "cooldown_remaining_sec": loss_cooldown_remaining_sec()})
 
 @app.route("/daily-cap/reset", methods=["POST", "GET"])
 def daily_cap_reset():
@@ -1859,6 +2012,12 @@ log.info(f"📐 Baseline initialized — enabled={BASELINE_ENABLED}, "
 # PROFIT_LOCK_ENABLED env var so you can flip it without a redeploy).
 _profit_lock_thread = threading.Thread(target=profit_lock_worker, daemon=True)
 _profit_lock_thread.start()
+
+# Start the loss-lock monitor thread (unconditional — self-gates on
+# LOSS_LOCK_ENABLED env var, which defaults to false. Set it to "true" on
+# Railway when you want loss-side circuit-breaking active).
+_loss_lock_thread = threading.Thread(target=loss_lock_worker, daemon=True)
+_loss_lock_thread.start()
 
 # Start the baseline monitor thread (unconditional — self-gates on BASELINE_ENABLED).
 _baseline_thread = threading.Thread(target=baseline_worker, daemon=True)
