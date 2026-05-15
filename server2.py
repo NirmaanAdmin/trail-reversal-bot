@@ -796,9 +796,14 @@ def close_all_positions(trigger_reason="profit lock", trigger_pct=None, lock_typ
             lev = trade.get("leverage", DEFAULT_LEVERAGE)
             mcy = trade.get("margin_ccy", DEFAULT_MARGIN)
             log.info(f"🔻 LOCK close: {close_side.upper()} {close_qty} {sym}")
-            result = client.place_order(
-                pair=sym, side=close_side, order_type="market_order",
-                total_quantity=close_qty, leverage=lev, margin_currency=mcy
+            # Use mark price as the reference for re-rounding on retry. fetch_mark_price
+            # returns a recent value (cached/webhook fallback); if unavailable we use
+            # entry_price since both branches inside the helper only use price as a
+            # fallback heuristic — the cache hit from learning the step is what matters.
+            ref_price = fetch_mark_price(sym) or float(trade.get("entry_price", 0) or 1)
+            result, close_qty = place_order_step_aware(
+                pair=sym, side=close_side, qty=close_qty, price=ref_price,
+                leverage=lev, margin_ccy=mcy, label=f"{lock_type}_lock_close"
             )
             if isinstance(result, dict) and result.get("status") == "error":
                 log.warning(f"⚠️ Lock close failed for {sym}: {result.get('message','')}")
@@ -1328,10 +1333,9 @@ def webhook():
             close_side = "sell" if trade["side"] == "buy" else "buy"
             log.info(f"📦 BOOK #{trade['books_done']+1}: closing {book_qty} of {trade['qty']} {symbol}")
 
-            result = client.place_order(
-                pair=symbol, side=close_side, order_type="market_order",
-                total_quantity=book_qty, leverage=leverage,
-                margin_currency=margin_ccy
+            result, book_qty = place_order_step_aware(
+                pair=symbol, side=close_side, qty=book_qty, price=coin_price,
+                leverage=leverage, margin_ccy=margin_ccy, label="book"
             )
 
             if isinstance(result, dict) and result.get("status") == "error":
@@ -1382,10 +1386,11 @@ def webhook():
 
                 if close_qty > 0:
                     log.info(f"🔻 REVERSE close: {close_side.upper()} {close_qty} {symbol}")
-                    close_result = client.place_order(
-                        pair=symbol, side=close_side, order_type="market_order",
-                        total_quantity=close_qty, leverage=trade.get("leverage", leverage),
-                        margin_currency=trade.get("margin_ccy", margin_ccy)
+                    close_result, close_qty = place_order_step_aware(
+                        pair=symbol, side=close_side, qty=close_qty, price=coin_price,
+                        leverage=trade.get("leverage", leverage),
+                        margin_ccy=trade.get("margin_ccy", margin_ccy),
+                        label="reverse_close"
                     )
                     if isinstance(close_result, dict) and close_result.get("status") == "error":
                         err = close_result.get("message", "")
@@ -1479,10 +1484,11 @@ def webhook():
                     }.get(reason, reason.upper())
                     log.info(f"🔻 {reason_label} close: "
                              f"{close_side.upper()} {close_qty} {symbol}")
-                    result = client.place_order(
-                        pair=symbol, side=close_side, order_type="market_order",
-                        total_quantity=close_qty, leverage=trade.get("leverage", leverage),
-                        margin_currency=trade.get("margin_ccy", margin_ccy)
+                    result, close_qty = place_order_step_aware(
+                        pair=symbol, side=close_side, qty=close_qty, price=coin_price,
+                        leverage=trade.get("leverage", leverage),
+                        margin_ccy=trade.get("margin_ccy", margin_ccy),
+                        label=f"close_{reason}"
                     )
                     if isinstance(result, dict) and result.get("status") == "error":
                         log.warning(f"⚠️ Close may have failed: {result.get('message','')}")
