@@ -356,6 +356,143 @@ _daily_counter_date        = None  # tracks which IST date the counter belongs t
 IST_TZ = timezone(timedelta(hours=5, minutes=30))
 
 # ═══════════════════════════════════════════════════════════
+#  STREAK PAUSE — circuit breaker on consecutive profit locks
+# ═══════════════════════════════════════════════════════════
+# When N profit locks fire in a row without an intervening loss lock,
+# pause new entries/reverses for STREAK_PAUSE_SEC seconds. Default: 3
+# profit locks → 1-hour pause. Books and closes still flow (consistent
+# with baseline cooldown pattern) so any straggler signals on still-open
+# positions can resolve cleanly.
+#
+# Counter resets to 0 on:
+#   (a) any loss lock fires
+#   (b) the streak pause expires (so the next streak starts fresh)
+#   (c) manual /streak-pause/reset
+#
+# State persists across Railway restarts in STREAK_FILE — without this,
+# a redeploy in the middle of a streak silently resets progress.
+STREAK_PAUSE_ENABLED  = os.environ.get("STREAK_PAUSE_ENABLED", "true").lower() == "true"
+STREAK_PAUSE_COUNT    = int(os.environ.get("STREAK_PAUSE_COUNT", "3"))
+STREAK_PAUSE_SEC      = int(os.environ.get("STREAK_PAUSE_SEC", "3600"))  # 1 hour
+STREAK_FILE           = os.environ.get("STREAK_FILE", "/app/data/streak_state.json")
+
+# Shared state
+_streak_profit_lock_count = 0      # consecutive profit locks since last reset
+_streak_pause_until       = 0.0    # epoch; entries/reverses rejected until this
+_streak_last_lock_at      = None   # ISO timestamp of last profit lock
+_streak_history           = []     # list of {ts, count, paused, reason} (last 50)
+
+
+def load_streak_state():
+    """Load streak state from disk. Falls back to in-memory defaults if file
+    is missing/corrupt. Persists across redeploys when a volume is mounted
+    at STREAK_FILE's parent directory."""
+    global _streak_profit_lock_count, _streak_pause_until
+    global _streak_last_lock_at, _streak_history
+    try:
+        with open(STREAK_FILE) as f:
+            state = json.load(f)
+        _streak_profit_lock_count = int(state.get("count", 0))
+        _streak_pause_until       = float(state.get("pause_until", 0.0))
+        _streak_last_lock_at      = state.get("last_lock_at")
+        _streak_history           = state.get("history", [])
+        log.info(f"📊 Streak loaded: count={_streak_profit_lock_count}, "
+                 f"paused={_streak_pause_until > time.time()}, "
+                 f"history_len={len(_streak_history)}")
+    except FileNotFoundError:
+        log.info(f"📊 No streak file at {STREAK_FILE} — streak counter starts at 0")
+    except (json.JSONDecodeError, ValueError, KeyError) as e:
+        log.warning(f"⚠️ Streak file corrupt ({e}) — starting fresh")
+
+
+def save_streak_state():
+    """Persist current streak state to disk."""
+    try:
+        os.makedirs(os.path.dirname(STREAK_FILE), exist_ok=True)
+        with open(STREAK_FILE, "w") as f:
+            json.dump({
+                "count": _streak_profit_lock_count,
+                "pause_until": _streak_pause_until,
+                "last_lock_at": _streak_last_lock_at,
+                "history": _streak_history[-50:],
+            }, f, indent=2)
+    except Exception as e:
+        log.error(f"❌ Failed to save streak state: {e}")
+
+
+def in_streak_pause():
+    """Return True if streak pause is currently active. Lazy-resets the
+    counter when the pause expires so the next streak starts from 0."""
+    global _streak_profit_lock_count, _streak_pause_until
+    if _streak_pause_until <= 0:
+        return False
+    if time.time() < _streak_pause_until:
+        return True
+    # Pause has expired — clear it and reset counter for next streak
+    if _streak_profit_lock_count > 0 or _streak_pause_until > 0:
+        log.info(f"✅ Streak pause cleared — counter reset (was {_streak_profit_lock_count}), entries enabled")
+        _streak_profit_lock_count = 0
+        _streak_pause_until = 0.0
+        _streak_history.append({
+            "ts": datetime.now(timezone.utc).isoformat(),
+            "event": "pause_expired",
+            "count": 0,
+        })
+        save_streak_state()
+    return False
+
+
+def streak_pause_remaining_sec():
+    if not in_streak_pause():
+        return 0
+    return max(0, int(_streak_pause_until - time.time()))
+
+
+def _register_profit_lock(trigger_pct=None):
+    """Called inside close_all_positions when a PROFIT lock fires. Increments
+    the consecutive-lock counter. If the counter reaches STREAK_PAUSE_COUNT,
+    activates the pause window."""
+    global _streak_profit_lock_count, _streak_pause_until, _streak_last_lock_at
+    _streak_profit_lock_count += 1
+    _streak_last_lock_at = datetime.now(timezone.utc).isoformat()
+    log.info(f"📈 Profit-lock streak: {_streak_profit_lock_count}/{STREAK_PAUSE_COUNT}")
+    event = {
+        "ts": _streak_last_lock_at,
+        "event": "profit_lock",
+        "count": _streak_profit_lock_count,
+        "trigger_pct": trigger_pct,
+    }
+    if STREAK_PAUSE_ENABLED and _streak_profit_lock_count >= STREAK_PAUSE_COUNT:
+        _streak_pause_until = time.time() + STREAK_PAUSE_SEC
+        pause_end = datetime.fromtimestamp(_streak_pause_until).strftime("%H:%M:%S")
+        mins = STREAK_PAUSE_SEC // 60
+        log.warning(f"⏸️ STREAK PAUSE: {_streak_profit_lock_count} consecutive profit locks "
+                    f"— pausing entries/reverses for {mins}m (until {pause_end})")
+        event["paused"] = True
+        event["pause_until"] = _streak_pause_until
+    _streak_history.append(event)
+    save_streak_state()
+
+
+def _register_loss_lock():
+    """Called inside close_all_positions when a LOSS lock fires. Resets
+    the streak counter to 0 and clears any active pause."""
+    global _streak_profit_lock_count, _streak_pause_until
+    if _streak_profit_lock_count == 0 and _streak_pause_until <= 0:
+        return  # nothing to reset
+    log.info(f"🔄 Streak reset by loss lock — counter was {_streak_profit_lock_count}, "
+             f"pause was {'active' if _streak_pause_until > time.time() else 'inactive'}")
+    _streak_history.append({
+        "ts": datetime.now(timezone.utc).isoformat(),
+        "event": "loss_lock_reset",
+        "previous_count": _streak_profit_lock_count,
+    })
+    _streak_profit_lock_count = 0
+    _streak_pause_until = 0.0
+    save_streak_state()
+
+
+# ═══════════════════════════════════════════════════════════
 #  BASELINE EQUITY TARGET — auto-rollover profit lock
 # ═══════════════════════════════════════════════════════════
 # Tracks cumulative realized P&L since a baseline was set. When current
@@ -825,6 +962,8 @@ def close_all_positions(trigger_reason="profit lock", trigger_pct=None, lock_typ
         _loss_lock_until = time.time() + LOSS_LOCK_COOLDOWN_SEC
         cooldown_end = datetime.fromtimestamp(_loss_lock_until).strftime("%H:%M:%S")
         log.info(f"✅ LOSS LOCK complete — all positions closed, cooldown until {cooldown_end}")
+        # Loss lock breaks any active profit-lock streak
+        _register_loss_lock()
         # Intentionally NOT bumping the daily counter for loss events
     else:
         _profit_lock_until = time.time() + COOLDOWN_AFTER_LOCK_SEC
@@ -832,6 +971,8 @@ def close_all_positions(trigger_reason="profit lock", trigger_pct=None, lock_typ
         log.info(f"✅ PROFIT LOCK complete — all positions closed, cooldown until {cooldown_end}")
         if trigger_pct is not None:
             _bump_daily_counter(trigger_pct)
+        # Register with the streak tracker (may trigger the 1-hour pause)
+        _register_profit_lock(trigger_pct=trigger_pct)
 
 
 def profit_lock_worker():
@@ -1241,6 +1382,23 @@ def webhook():
             log_trade_event(symbol, action, alert_type, "BASELINE_COOLDOWN", f"{remaining}s remaining")
             return jsonify({"status": "rejected", "reason": f"baseline cooldown ({remaining}s)"}), 200
 
+        # ─── STREAK PAUSE GATE ────────────────────────────────
+        # If STREAK_PAUSE_COUNT (default 3) profit locks fired in a row without
+        # a loss lock in between, pause ENTRY and REVERSE for STREAK_PAUSE_SEC
+        # (default 3600s = 1h). Books and closes still flow so any straggler
+        # Pine signals on still-open positions can resolve. Reset on either
+        # (a) loss lock fires, (b) pause expires, (c) /streak-pause/reset.
+        if in_streak_pause() and alert_type in ("entry", "reverse"):
+            remaining = streak_pause_remaining_sec()
+            log.info(f"⏸️ STREAK PAUSE: rejecting {alert_type} for {symbol} — "
+                     f"{_streak_profit_lock_count} consecutive profit locks, "
+                     f"{remaining}s remaining")
+            log_trade_event(symbol, action, alert_type, "STREAK_PAUSE",
+                            f"{_streak_profit_lock_count} locks, {remaining}s remaining")
+            return jsonify({"status": "rejected",
+                            "reason": f"streak pause ({_streak_profit_lock_count} consecutive "
+                                      f"profit locks, {remaining}s remaining)"}), 200
+
         # ─── SL LOCKOUT GATE ──────────────────────────────────
         # If this symbol's SL was hit within SL_LOCKOUT_SEC, reject
         # any new entry/reverse for it. Books and closes pass through
@@ -1561,6 +1719,15 @@ def status():
             "ist_date": str(_daily_counter_date) if _daily_counter_date else None,
             "ist_now": datetime.now(IST_TZ).isoformat(),
         },
+        "streak_pause": {
+            "enabled": STREAK_PAUSE_ENABLED,
+            "count_required": STREAK_PAUSE_COUNT,
+            "pause_sec": STREAK_PAUSE_SEC,
+            "current_count": _streak_profit_lock_count,
+            "is_paused": in_streak_pause(),
+            "pause_remaining_sec": streak_pause_remaining_sec(),
+            "last_lock_at": _streak_last_lock_at,
+        },
         "time": datetime.now().isoformat()
     })
 
@@ -1700,6 +1867,64 @@ def daily_cap_check():
         "is_paused": _daily_paused,
         "ist_date": str(_daily_counter_date) if _daily_counter_date else None,
         "ist_now": datetime.now(IST_TZ).isoformat(),
+    })
+
+
+# ═══════════════════════════════════════════════════════════
+#  STREAK PAUSE ENDPOINTS
+# ═══════════════════════════════════════════════════════════
+@app.route("/streak-pause/status", methods=["GET"])
+def streak_pause_status():
+    """Read-only view of consecutive-profit-lock streak state.
+    No auth required. Use this to verify the counter is where you expect
+    or to check how much time is left on an active pause."""
+    return jsonify({
+        "enabled": STREAK_PAUSE_ENABLED,
+        "count_required": STREAK_PAUSE_COUNT,
+        "pause_sec": STREAK_PAUSE_SEC,
+        "current_count": _streak_profit_lock_count,
+        "is_paused": in_streak_pause(),
+        "pause_remaining_sec": streak_pause_remaining_sec(),
+        "last_lock_at": _streak_last_lock_at,
+        "history_count": len(_streak_history),
+        "history_recent": _streak_history[-10:],
+    }), 200
+
+
+@app.route("/streak-pause/reset", methods=["POST", "GET"])
+def streak_pause_reset():
+    """Manually clear the streak pause and reset the counter to 0.
+    Useful for unpausing without waiting for the 1-hour timer.
+    Does NOT affect active_trades, profit-lock cooldown, or daily cap.
+    Requires ?secret=... matching WEBHOOK_SECRET."""
+    global _streak_profit_lock_count, _streak_pause_until
+    if WEBHOOK_SECRET and request.args.get("secret") != WEBHOOK_SECRET:
+        return jsonify({"error": "unauthorized"}), 401
+    prev_count = _streak_profit_lock_count
+    prev_paused = in_streak_pause()
+    prev_remaining = streak_pause_remaining_sec()
+    _streak_profit_lock_count = 0
+    _streak_pause_until = 0.0
+    _streak_history.append({
+        "ts": datetime.now(timezone.utc).isoformat(),
+        "event": "manual_reset",
+        "previous_count": prev_count,
+    })
+    save_streak_state()
+    log.info(f"🔄 Streak manually reset by operator "
+             f"(was: count={prev_count}, paused={prev_paused}, "
+             f"remaining={prev_remaining}s)")
+    return jsonify({
+        "status": "reset",
+        "previous": {
+            "count": prev_count,
+            "was_paused": prev_paused,
+            "remaining_sec": prev_remaining,
+        },
+        "current": {
+            "count": 0,
+            "is_paused": False,
+        }
     })
 
 @app.route("/stats", methods=["GET"])
@@ -2007,6 +2232,15 @@ log.info("🤖 Trail TP/SL Rev Bot ready — Pine-driven bookings + native SL")
 _check_and_reset_daily_counter()
 log.info(f"📅 Daily cap initialized — IST date {_daily_counter_date}, "
          f"cap={DAILY_CAP_PCT}%, enabled={DAILY_CAP_ENABLED}")
+
+# Load streak state from disk (persists across redeploys if volume mounted).
+# Without this, a mid-streak Railway restart silently wipes the counter and
+# could let a 4th profit lock fire without triggering the pause.
+load_streak_state()
+log.info(f"📊 Streak pause initialized — enabled={STREAK_PAUSE_ENABLED}, "
+         f"count_required={STREAK_PAUSE_COUNT}, pause_sec={STREAK_PAUSE_SEC}, "
+         f"current_count={_streak_profit_lock_count}, "
+         f"is_paused={in_streak_pause()}")
 
 # Load baseline state from disk (persists across redeploys if volume mounted)
 load_baseline_state()
