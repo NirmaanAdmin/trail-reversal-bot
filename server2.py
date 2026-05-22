@@ -665,6 +665,66 @@ def fetch_real_positions_unrealized_inr():
         return None
 
 
+def fetch_real_positions_map():
+    """Return a {symbol: {qty_abs, side, leverage, margin_ccy, active_pos}} dict
+    of every non-zero INR-margin futures position currently open on CoinDCX.
+
+    Orphan-proof: this is the source-of-truth for what's actually open on the
+    exchange, independent of active_trades. Used by close_all_positions to
+    close the REAL position size (not the bot's tracked qty, which can drift
+    due to float arithmetic on books or pre-existing positions from before
+    the bot started / after a crash).
+
+      side       — direction the position IS on ('buy' for long, 'sell' for short).
+                   To CLOSE, send the opposite side.
+      qty_abs    — positive number to use as total_quantity on the close order.
+      active_pos — signed CoinDCX value (negative for shorts) for diagnostics.
+
+    Returns None on any fetch / parse failure so callers can degrade to the
+    tracked-qty fallback rather than silently doing nothing."""
+    try:
+        resp = _sign_post(
+            "/exchange/v1/derivatives/futures/positions",
+            {"page": "1", "size": "100", "margin_currency_short_name": ["INR"]},
+        )
+        if resp.status_code != 200:
+            log.warning(f"fetch_real_positions_map: HTTP {resp.status_code}")
+            return None
+        positions = resp.json()
+        result = {}
+        for p in positions:
+            try:
+                qty = float(p.get("active_pos", 0) or 0)
+            except (TypeError, ValueError):
+                continue
+            if qty == 0:
+                continue
+            symbol = p.get("pair", "")
+            if not symbol:
+                continue
+            # leverage and margin_ccy may be absent on some position payloads;
+            # we degrade to the bot's defaults rather than skip the position.
+            try:
+                lev = int(p.get("leverage", DEFAULT_LEVERAGE) or DEFAULT_LEVERAGE)
+            except (TypeError, ValueError):
+                lev = DEFAULT_LEVERAGE
+            mcy_raw = p.get("margin_currency_short_name") or DEFAULT_MARGIN
+            mcy = mcy_raw[0] if isinstance(mcy_raw, list) and mcy_raw else (
+                mcy_raw if isinstance(mcy_raw, str) else DEFAULT_MARGIN
+            )
+            result[symbol] = {
+                "qty_abs": abs(qty),
+                "side": "buy" if qty > 0 else "sell",
+                "leverage": lev,
+                "margin_ccy": mcy,
+                "active_pos": qty,
+            }
+        return result
+    except Exception as e:
+        log.warning(f"fetch_real_positions_map: {e}")
+        return None
+
+
 def fetch_real_current_value():
     """Compute the same 'Current value' shown in CoinDCX UI.
     Returns (current_value, wallet_inr, unrealized_inr) or (None, None, None)
@@ -918,20 +978,63 @@ def close_all_positions(trigger_reason="profit lock", trigger_pct=None, lock_typ
     Both call paths emit the same "🔒 LOCK close" log line per symbol so
     Railway logs read the same. The header/footer log lines distinguish
     PROFIT LOCK vs LOSS LOCK so you can tell at a glance what fired.
+
+    Orphan-proof: queries CoinDCX's /positions endpoint up-front and uses
+    the REAL active_pos as the close quantity (not the bot's tracked qty,
+    which can drift from float arithmetic, partial fills, or pre-existing
+    positions from before the bot started). After the first pass, sleeps
+    briefly and re-queries — if anything is still open (e.g. the step-aware
+    retry rounded down a close and left a residue), it sweeps the remainder.
+    The union of active_trades + real positions also catches orphan
+    positions on symbols the bot isn't even tracking.
     """
     global _profit_lock_until, _loss_lock_until
     snapshot = list(active_trades.items())
     header_emoji = "🛑" if lock_type == "loss" else "🔒"
     header_label = "LOSS LOCK" if lock_type == "loss" else "PROFIT LOCK"
     log.info(f"{header_emoji} {header_label} triggered ({trigger_reason}) — closing {len(snapshot)} positions")
-    for sym, trade in snapshot:
+
+    # Query CoinDCX for the actual position state. If this fails, we degrade
+    # gracefully to the tracked qty (legacy behavior); orphan risk returns
+    # for this one lock cycle, but the alternative (skipping the lock
+    # because we can't verify) is worse.
+    real_positions = fetch_real_positions_map()
+    if real_positions is None:
+        log.warning("⚠️ Real-position fetch failed — falling back to tracked qty (orphan risk for this lock)")
+        real_positions = {}
+
+    # Iterate the union: anything the bot is tracking AND anything CoinDCX
+    # shows as open. This catches orphans on symbols the bot lost track of
+    # (e.g. across the previous deploy crash).
+    symbols_to_close = set(active_trades.keys()) | set(real_positions.keys())
+    for sym in symbols_to_close:
         try:
-            close_qty = float(trade.get("qty", 0) or 0)
+            trade = active_trades.get(sym, {})
+            tracked_qty = float(trade.get("qty", 0) or 0)
+
+            # Prefer the real CoinDCX position size. Fall back to tracked qty
+            # only if the position isn't visible via the API (rare).
+            if sym in real_positions:
+                close_qty = real_positions[sym]["qty_abs"]
+                close_side = "sell" if real_positions[sym]["side"] == "buy" else "buy"
+                lev = real_positions[sym]["leverage"] if not trade else trade.get("leverage", real_positions[sym]["leverage"])
+                mcy = real_positions[sym]["margin_ccy"] if not trade else trade.get("margin_ccy", real_positions[sym]["margin_ccy"])
+                if tracked_qty > 0 and abs(close_qty - tracked_qty) > 1e-9:
+                    log.info(f"📐 {sym} qty mismatch — tracked={tracked_qty}, real={close_qty} (using real)")
+                if not trade:
+                    log.info(f"🧹 {sym} found on CoinDCX but NOT in active_trades — orphan being cleaned up")
+            elif tracked_qty > 0:
+                # Real fetch failed earlier; fall back to tracker
+                close_qty = tracked_qty
+                close_side = "sell" if trade.get("side") == "buy" else "buy"
+                lev = trade.get("leverage", DEFAULT_LEVERAGE)
+                mcy = trade.get("margin_ccy", DEFAULT_MARGIN)
+            else:
+                continue  # tracked but qty=0 and not on exchange — nothing to do
+
             if close_qty <= 0:
                 continue
-            close_side = "sell" if trade.get("side") == "buy" else "buy"
-            lev = trade.get("leverage", DEFAULT_LEVERAGE)
-            mcy = trade.get("margin_ccy", DEFAULT_MARGIN)
+
             log.info(f"🔻 LOCK close: {close_side.upper()} {close_qty} {sym}")
             # Use mark price as the reference for re-rounding on retry. fetch_mark_price
             # returns a recent value (cached/webhook fallback); if unavailable we use
@@ -949,6 +1052,52 @@ def close_all_positions(trigger_reason="profit lock", trigger_pct=None, lock_typ
                             "FILLED", trigger_reason)
         except Exception as e:
             log.error(f"❌ Lock close exception for {sym}: {e}", exc_info=True)
+
+    # ─── POST-CLOSE SWEEP ────────────────────────────────────
+    # The step-aware retry rounds DOWN on divisibility errors, which on a
+    # CLOSE leaves the difference behind as an orphan. Wait briefly for
+    # CoinDCX to settle the market orders, then re-query positions. Anything
+    # still open gets a second close attempt — and by now the qty_step_cache
+    # has the correct step (learned from the first reject), so this attempt
+    # uses the right multiple from the start.
+    try:
+        time.sleep(1.5)  # let CoinDCX settle the close orders
+        residual = fetch_real_positions_map()
+        if residual:
+            log.warning(f"⚠️ Post-lock sweep: {len(residual)} position(s) still open: {list(residual.keys())}")
+            for sym, pos in residual.items():
+                try:
+                    sweep_qty = pos["qty_abs"]
+                    sweep_side = "sell" if pos["side"] == "buy" else "buy"
+                    sweep_lev = pos["leverage"]
+                    sweep_mcy = pos["margin_ccy"]
+                    # Pre-snap to the step grid before sending — qty_step_cache
+                    # should now have the correct value, learned from the first
+                    # pass's rejection (if any).
+                    step = get_qty_step(sym)
+                    if step and step > 0:
+                        decimals = max(0, -math.floor(math.log10(step)))
+                        sweep_qty = round(math.floor(sweep_qty / step) * step, decimals)
+                    if sweep_qty <= 0:
+                        log.warning(f"⚠️ Sweep skipped for {sym} — qty floors to 0 (step={step}, real={pos['qty_abs']})")
+                        continue
+                    log.info(f"🧹 SWEEP close: {sweep_side.upper()} {sweep_qty} {sym}")
+                    ref_price = fetch_mark_price(sym) or 1
+                    result, sweep_qty = place_order_step_aware(
+                        pair=sym, side=sweep_side, qty=sweep_qty, price=ref_price,
+                        leverage=sweep_lev, margin_ccy=sweep_mcy,
+                        label=f"{lock_type}_lock_sweep"
+                    )
+                    if isinstance(result, dict) and result.get("status") == "error":
+                        log.warning(f"⚠️ Sweep close failed for {sym}: {result.get('message','')} — "
+                                    f"manual cleanup may be required")
+                except Exception as e:
+                    log.error(f"❌ Sweep exception for {sym}: {e}", exc_info=True)
+        else:
+            log.info("✅ Post-lock sweep: no residual positions found")
+    except Exception as e:
+        log.error(f"❌ Post-lock sweep error: {e}", exc_info=True)
+
     # Cancel native SLs, clear tracking
     for sym in list(native_sl_orders.keys()):
         try:
@@ -1507,6 +1656,19 @@ def webhook():
 
             # Update tracked qty and TP/SL from Pine
             trade["qty"] -= book_qty
+            # Snap to the symbol's qty step to absorb floating-point drift.
+            # Without this, e.g. 0.013 - 0.004 = 0.008999999999999998 in Python,
+            # which CoinDCX then rejects as not divisible by 0.001. The
+            # step-aware retry rounds DOWN to 0.008, leaving 0.001 as a naked
+            # orphan on the exchange. Rounding (not flooring) to the nearest
+            # step undoes float error in both directions and lands us back on
+            # the clean grid (0.008999... → 0.009).
+            step = get_qty_step(symbol)
+            if step and step > 0:
+                decimals = max(0, -math.floor(math.log10(step)))
+                trade["qty"] = round(round(trade["qty"] / step) * step, decimals)
+                if trade["qty"] < 0:
+                    trade["qty"] = 0.0
             trade["books_done"] += 1
             if tp_price:
                 trade["tp_price"] = tp_price
