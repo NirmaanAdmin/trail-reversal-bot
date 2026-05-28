@@ -919,6 +919,59 @@ def compute_net_roe():
     return total_pnl, total_margin, (total_pnl / total_margin) * 100
 
 
+# ═══════════════════════════════════════════════════════════
+#  RECONCILE — prune phantom positions from active_trades
+# ═══════════════════════════════════════════════════════════
+# A "phantom" is a symbol the bot still tracks in active_trades but that
+# CoinDCX reports as flat (closed on the exchange, e.g. a close/reverse
+# webhook was suppressed by Pine's v3 guard, rejected by a gate, the order
+# failed, or the position was closed manually). Phantoms poison
+# compute_net_roe() — they're marked with live prices against a stale entry,
+# dragging the computed net% away from reality. Left unpruned they can flip
+# the sign of net ROE (real +1.8% reported as -2.9%), which can spuriously
+# trip BOTH the profit-lock and the loss-lock (the latter would flatten real
+# WINNING positions).
+#
+# This pass asks CoinDCX what's actually open (fetch_real_positions_map) and
+# drops any tracked symbol the exchange doesn't list. It places NO orders —
+# the phantom is already flat; we only delete the stale bookkeeping entry.
+#
+# SAFETY:
+#   • Fetch failure (None) → NO-OP. We never prune on a transient API blip;
+#     better to keep a stale phantom one more cycle than evict a live position.
+#   • INR-margin assumption: fetch_real_positions_map queries INR-margin
+#     positions only (matches this bot's DEFAULT_MARGIN=INR and all live Pine
+#     alerts). If you ever run USDT-margin positions, widen that query first
+#     or they'll be seen as phantoms and pruned.
+RECONCILE_ENABLED = os.environ.get("RECONCILE_ENABLED", "true").lower() == "true"
+
+def reconcile_active_trades(context="reconcile"):
+    """Prune phantom entries (tracked-but-flat-on-exchange) from active_trades.
+    Returns list of pruned symbols, [] if nothing to do, or None if skipped
+    (disabled or positions fetch failed). Places NO orders — pop() only."""
+    if not RECONCILE_ENABLED:
+        return None
+    if not active_trades:
+        return []
+    real = fetch_real_positions_map()
+    if real is None:
+        # Conservative: fetch failed → leave active_trades untouched this cycle.
+        log.debug(f"reconcile ({context}): positions fetch failed — skipping")
+        return None
+    real_syms = set(real.keys())
+    phantoms = [s for s in list(active_trades.keys()) if s not in real_syms]
+    for s in phantoms:
+        active_trades.pop(s, None)
+        log.info(f"🧹 RECONCILE ({context}): pruned phantom {s} — flat on "
+                 f"CoinDCX, removed from tracking (NO order placed)")
+    if phantoms:
+        _save_active_trades()
+        log.info(f"🧹 RECONCILE ({context}): pruned {len(phantoms)} phantom(s) "
+                 f"{phantoms} — active_trades now {len(active_trades)} "
+                 f"{list(active_trades.keys())}")
+    return phantoms
+
+
 # ─── DAILY CAP HELPERS ─────────────────────────────────────
 def _current_ist_date():
     """Return today's date in IST as a date object."""
@@ -1138,6 +1191,12 @@ def profit_lock_worker():
                 continue  # in cooldown window
             if not active_trades:
                 continue
+            # Reconcile against exchange truth FIRST — drop phantoms so the
+            # lock math reflects reality, not stale tracking. No-op on fetch
+            # failure (leaves active_trades untouched).
+            reconcile_active_trades(context="profit-lock")
+            if not active_trades:
+                continue  # every tracked position was a phantom
             pnl, margin, pct = compute_net_roe()
             if pct is None:
                 log.debug("profit-lock: price fetch unavailable this cycle")
@@ -1190,6 +1249,12 @@ def loss_lock_worker():
                 continue
             if not active_trades:
                 continue
+            # Reconcile against exchange truth FIRST — critical here: a phantom
+            # dragging net% negative could spuriously trip the loss-lock and
+            # flatten REAL winning positions. No-op on fetch failure.
+            reconcile_active_trades(context="loss-lock")
+            if not active_trades:
+                continue  # every tracked position was a phantom
             pnl, margin, pct = compute_net_roe()
             if pct is None:
                 log.debug("loss-lock: price fetch unavailable this cycle")
@@ -2168,9 +2233,38 @@ def clear_tracking():
     })
 
 
-# ═══════════════════════════════════════════════════════════
-#  SL LOCKOUT ENDPOINTS
-# ═══════════════════════════════════════════════════════════
+@app.route("/reconcile", methods=["GET", "POST"])
+def reconcile_endpoint():
+    """Manually prune phantom positions (tracked-but-flat-on-CoinDCX) from
+    active_trades. Same logic the profit/loss-lock workers run each cycle.
+    Places NO orders — only removes stale tracking entries. Requires
+    ?secret=... matching WEBHOOK_SECRET.
+
+    Use when /status shows more positions than CoinDCX actually has, or when
+    the net% in logs disagrees with the exchange. Returns what was pruned and
+    the resulting tracked set.
+
+    Bookmarkable:
+      https://your-app.up.railway.app/reconcile?secret=YOUR_SECRET"""
+    if WEBHOOK_SECRET and request.args.get("secret") != WEBHOOK_SECRET:
+        return jsonify({"error": "unauthorized"}), 401
+    before = list(active_trades.keys())
+    real = fetch_real_positions_map()
+    if real is None:
+        return jsonify({
+            "status": "skipped",
+            "reason": "positions fetch failed — no pruning done (safe)",
+            "tracked": before,
+        }), 200
+    pruned = reconcile_active_trades(context="manual")
+    return jsonify({
+        "status": "ok",
+        "pruned": pruned or [],
+        "pruned_count": len(pruned or []),
+        "tracked_before": before,
+        "tracked_after": list(active_trades.keys()),
+        "exchange_open": sorted(real.keys()),
+    }), 200
 @app.route("/sl-lockout/status", methods=["GET"])
 def sl_lockout_status():
     """Returns currently locked symbols with remaining seconds.
