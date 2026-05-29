@@ -725,6 +725,61 @@ def fetch_real_positions_map():
         return None
 
 
+def wait_for_symbol_flat(symbol, timeout=4.0, poll_interval=0.25):
+    """Poll fetch_real_positions_map() until `symbol` shows no open position
+    on CoinDCX, or until `timeout` seconds have elapsed.
+
+    Returns:
+      True   — symbol is confirmed flat on the exchange (safe to reopen)
+      False  — timeout reached, position still showing open (abort the reopen)
+      None   — exchange fetch failed mid-poll (caller decides how to degrade)
+
+    Why this exists
+    ───────────────
+    The reverse handler closes the existing position then opens the opposite
+    direction. CoinDCX runs isolated margin: when a close+reopen happen within
+    a short window, the reopen can lock fresh margin BEFORE the close's
+    margin-release has propagated, leaving the surviving single position with
+    margin attached from BOTH legs (single position size, double margin).
+
+    Real incidents:
+      • 2026-05-28 INJ — entry → reverse 0.34s later → ₹993 margin on a ₹499
+                          position (size matched one position, margin doubled).
+      • 2026-05-29 ZEC — same pattern, manifested as "Insufficient funds" on
+                          the close because the entry hadn't settled yet.
+      • 2026-05-29 HYPE — entry SELL @66.69 → reverse SELL @66.686 ~339ms
+                          later → 3 market orders (SELL, BUY, SELL) inside
+                          1.66s → ₹981 margin on a ~₹490 position.
+
+    The old behavior was a blind `time.sleep(1)` between close and reopen.
+    1s isn't enough during settlement races on CoinDCX isolated margin. This
+    helper actively confirms the exchange has fully released the position
+    before the caller fires the reopen, and tells the caller to abort if it
+    can't be confirmed within the timeout — better to stay flat for one cycle
+    than to stack margin.
+
+    Poll cadence: every 250ms for up to 4s = ~16 polls worst-case. In the
+    common case the symbol clears in the first 1–2 polls and we return early.
+    """
+    deadline = time.time() + timeout
+    polls = 0
+    while time.time() < deadline:
+        positions = fetch_real_positions_map()
+        polls += 1
+        if positions is None:
+            # API blip mid-poll. Don't decide blindly — surface to caller.
+            log.warning(f"⚠️ wait_for_symbol_flat({symbol}): API fetch returned None on poll {polls}")
+            return None
+        if symbol not in positions:
+            elapsed = timeout - max(0.0, deadline - time.time())
+            log.info(f"✅ {symbol} confirmed flat after {polls} poll(s) ({elapsed:.2f}s)")
+            return True
+        time.sleep(poll_interval)
+    log.warning(f"⚠️ {symbol} still open after {timeout}s ({polls} polls) — "
+                f"exchange close did not settle in time")
+    return False
+
+
 def fetch_real_current_value():
     """Compute the same 'Current value' shown in CoinDCX UI.
     Returns (current_value, wallet_inr, unrealized_inr) or (None, None, None)
@@ -1799,6 +1854,11 @@ def webhook():
         elif alert_type == "reverse":
             cancel_native_sl(symbol)
 
+            # Track whether we actually placed a close on the exchange. Only
+            # if we did do we need to wait for the close to settle before
+            # reopening. If the symbol wasn't tracked, there's nothing to
+            # settle and we go straight to the reverse-entry below.
+            close_was_placed = False
             if symbol in active_trades:
                 trade = active_trades[symbol]
                 close_side = "sell" if trade["side"] == "buy" else "buy"
@@ -1812,6 +1872,7 @@ def webhook():
                         margin_ccy=trade.get("margin_ccy", margin_ccy),
                         label="reverse_close"
                     )
+                    close_was_placed = True
                     if isinstance(close_result, dict) and close_result.get("status") == "error":
                         err = close_result.get("message", "")
                         log.warning(f"⚠️ Reverse close failed (likely already closed): {err}")
@@ -1829,7 +1890,38 @@ def webhook():
                 clear_active_trade(symbol, "reverse — SL hit")
                 log_trade_event(symbol, close_side, "reverse_close", "FILLED", "Pine reverse")
 
-            time.sleep(1)
+            # ─── POLL-CONFIRM-FLAT BEFORE REOPEN ──────────────────
+            # Previous behavior: blind `time.sleep(1)` here, then reopen.
+            # 1s wasn't enough during CoinDCX isolated-margin settlement
+            # races — the reopen would lock fresh margin while the close's
+            # margin-release was still in flight, leaving the surviving
+            # position carrying margin from both legs (single position size,
+            # double margin). Real incidents: INJ 2026-05-28, ZEC 2026-05-29,
+            # HYPE 2026-05-29. See wait_for_symbol_flat() docstring for the
+            # forensic detail.
+            #
+            # New behavior: actively poll the exchange until the symbol
+            # reads flat (up to 4s, ~16 polls). If it's still open at the
+            # timeout, ABORT the reopen — the bot stays flat and Pine's
+            # next entry signal will re-enter cleanly. Better one missed
+            # reverse than a stuck double-margin position.
+            #
+            # If we never placed a close (symbol wasn't tracked), skip the
+            # wait entirely — there's nothing to settle.
+            if close_was_placed:
+                flat = wait_for_symbol_flat(symbol, timeout=4.0, poll_interval=0.25)
+                if flat is False:
+                    log.error(f"❌ ABORT reverse reopen for {symbol} — exchange still "
+                              f"shows position open after 4s. Reopening now would "
+                              f"double-lock margin (real-incident pattern). Staying flat; "
+                              f"next Pine signal will re-enter cleanly.")
+                    log_trade_event(symbol, action, "reverse_entry", "ABORT",
+                                    "exchange close did not settle within 4s")
+                    return jsonify({"status": "aborted",
+                                    "reason": f"close on {symbol} did not settle within 4s"}), 200
+                # flat is True (verified flat) or None (API blip mid-poll).
+                # On None we've already waited up to 4s polling — strictly
+                # more conservative than the old blind 1s sleep — so proceed.
 
             quantity = calc_quantity(coin_price, leverage, symbol=symbol)
             if quantity <= 0:
