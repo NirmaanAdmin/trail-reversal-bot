@@ -998,12 +998,40 @@ def compute_net_roe():
 #     positions only (matches this bot's DEFAULT_MARGIN=INR and all live Pine
 #     alerts). If you ever run USDT-margin positions, widen that query first
 #     or they'll be seen as phantoms and pruned.
+#   • GRACE PERIOD (RECONCILE_GRACE_SEC, default 10s): we do NOT prune a
+#     symbol whose entry_time is within the last N seconds. CoinDCX's
+#     positions endpoint can lag a fresh market-order fill by 1–2 seconds
+#     (occasionally more). Without this guard, a worker tick that fires
+#     ~500ms after an entry sees the new position "missing" on CoinDCX and
+#     wrongly evicts it from active_trades. Any subsequent close/reverse
+#     webhook for that symbol then gets silently dropped with "not tracked",
+#     leaving a phantom REAL position on the exchange and divergent state
+#     between Pine and CoinDCX.
+#
+#     Real incident (2026-05-29 23:37-23:43 IST, 1000SHIB):
+#         18:07:06.641  📝 Tracked: SELL 4512 @ 0.005432
+#         18:07:07.090  🧹 RECONCILE pruned phantom (449ms after track)
+#         18:13:17.743  ☠️ CLOSE (signal_flip)
+#         18:13:17.743  ⚠️ Close for B-1000SHIB_USDT but not tracked
+#                       — close DROPPED, SHORT 4512 remained on CoinDCX
+#         18:13:32.165  📤 ENTRY buy 4501 (Pine reversed to long)
+#                       — CoinDCX netted: SHORT 11 phantom residual.
+#
+#     10s grace covers worst-case observed CoinDCX position-API lag with
+#     5x headroom; real phantoms (closed minutes ago) are unaffected and
+#     still get pruned on the next worker cycle.
 RECONCILE_ENABLED = os.environ.get("RECONCILE_ENABLED", "true").lower() == "true"
+RECONCILE_GRACE_SEC = float(os.environ.get("RECONCILE_GRACE_SEC", "10"))
 
 def reconcile_active_trades(context="reconcile"):
     """Prune phantom entries (tracked-but-flat-on-exchange) from active_trades.
     Returns list of pruned symbols, [] if nothing to do, or None if skipped
-    (disabled or positions fetch failed). Places NO orders — pop() only."""
+    (disabled or positions fetch failed). Places NO orders — pop() only.
+
+    Recently-tracked positions (entry_time within RECONCILE_GRACE_SEC) are
+    grace-protected and skipped; CoinDCX's positions endpoint can lag a
+    fresh fill, so a too-aggressive evict would silently desync the bot
+    from the exchange (see the big comment block above)."""
     if not RECONCILE_ENABLED:
         return None
     if not active_trades:
@@ -1014,11 +1042,31 @@ def reconcile_active_trades(context="reconcile"):
         log.debug(f"reconcile ({context}): positions fetch failed — skipping")
         return None
     real_syms = set(real.keys())
-    phantoms = [s for s in list(active_trades.keys()) if s not in real_syms]
+    now = time.time()
+    phantoms = []
+    skipped_grace = []  # symbols that look phantom but are too fresh to prune
+    for s in list(active_trades.keys()):
+        if s in real_syms:
+            continue
+        trade = active_trades.get(s) or {}
+        try:
+            entry_time = float(trade.get("entry_time", 0) or 0)
+        except (TypeError, ValueError):
+            entry_time = 0.0
+        age = now - entry_time
+        if age < RECONCILE_GRACE_SEC:
+            skipped_grace.append((s, age))
+            continue
+        phantoms.append(s)
     for s in phantoms:
         active_trades.pop(s, None)
         log.info(f"🧹 RECONCILE ({context}): pruned phantom {s} — flat on "
                  f"CoinDCX, removed from tracking (NO order placed)")
+    if skipped_grace:
+        pretty = ", ".join(f"{s}({age:.1f}s)" for s, age in skipped_grace)
+        log.info(f"🧹 RECONCILE ({context}): grace-protected {len(skipped_grace)} "
+                 f"recent position(s) [{pretty}] — within {RECONCILE_GRACE_SEC}s "
+                 f"of entry, CoinDCX positions API may not have caught up yet")
     if phantoms:
         _save_active_trades()
         log.info(f"🧹 RECONCILE ({context}): pruned {len(phantoms)} phantom(s) "
