@@ -1047,6 +1047,41 @@ def close_all_positions(trigger_reason="profit lock", trigger_pct=None, lock_typ
     header_label = "LOSS LOCK" if lock_type == "loss" else "PROFIT LOCK"
     log.info(f"{header_emoji} {header_label} triggered ({trigger_reason}) — closing {len(snapshot)} positions")
 
+    # ─── ARM COOLDOWN IMMEDIATELY ────────────────────────────
+    # Critical fix: arm the cooldown clock BEFORE the close loop runs so the
+    # webhook gate (in_profit_lock_cooldown / in_loss_lock_cooldown) starts
+    # rejecting new alerts the instant the lock fires. Previously, this
+    # assignment lived at the END of close_all_positions, AFTER iterating
+    # through every position (~400ms per market order + 1.5s sweep settle
+    # → 3-4s for 4 positions). Webhooks that landed in that window passed
+    # the gate and reopened positions.
+    #
+    # Real incident (2026-05-29 14:23 UTC):
+    #     14:23:44.638  🔒 PROFIT LOCK triggered — closing 4 positions
+    #     14:23:44.972  🔻 LOCK close SUI
+    #     14:23:45.275  🔻 LOCK close ENA
+    #     14:23:45.649  🔻 LOCK close INJ
+    #     14:23:45.866  🔻 LOCK close AVAX
+    #     14:23:46.251  📩 FET reverse webhook arrived       ← gate let it pass
+    #     14:23:47.240  📤 market_order sell 106 FET         ← reopened!
+    #     14:23:47.652  📩 1000BONK reverse webhook arrived  ← gate let it pass
+    #     14:23:48.032  ✅ PROFIT LOCK complete — cooldown set (too late)
+    #     14:23:48.664  📤 market_order sell 4580 1000BONK   ← reopened!
+    #     14:23:48.872  🔒 COOLDOWN: rejecting next FET entry (now armed)
+    #
+    # Arming up-front closes that window. The lock's own close orders are
+    # placed via place_order_step_aware() directly, NOT through the webhook
+    # handler, so the gate doesn't interfere with them.
+    #
+    # Side effect: cooldown duration is measured from trigger time instead
+    # of completion time, so users see ~3s less cooldown at the back end —
+    # negligible vs the bug. Behavior is identical for /profit-lock/force
+    # since it routes through this same function.
+    if lock_type == "loss":
+        _loss_lock_until = time.time() + LOSS_LOCK_COOLDOWN_SEC
+    else:
+        _profit_lock_until = time.time() + COOLDOWN_AFTER_LOCK_SEC
+
     # Query CoinDCX for the actual position state. If this fails, we degrade
     # gracefully to the tracked qty (legacy behavior); orphan risk returns
     # for this one lock cycle, but the alternative (skipping the lock
@@ -1159,16 +1194,16 @@ def close_all_positions(trigger_reason="profit lock", trigger_pct=None, lock_typ
             pass
     active_trades.clear()
     _save_active_trades()
-    # Arm the right cooldown clock and log accordingly
+    # Cooldown clock was armed at the TOP of this function (see the big
+    # comment block there). Here we just emit the completion log and
+    # register with the streak / daily-cap trackers.
     if lock_type == "loss":
-        _loss_lock_until = time.time() + LOSS_LOCK_COOLDOWN_SEC
         cooldown_end = datetime.fromtimestamp(_loss_lock_until).strftime("%H:%M:%S")
         log.info(f"✅ LOSS LOCK complete — all positions closed, cooldown until {cooldown_end}")
         # Loss lock breaks any active profit-lock streak
         _register_loss_lock()
         # Intentionally NOT bumping the daily counter for loss events
     else:
-        _profit_lock_until = time.time() + COOLDOWN_AFTER_LOCK_SEC
         cooldown_end = datetime.fromtimestamp(_profit_lock_until).strftime("%H:%M:%S")
         log.info(f"✅ PROFIT LOCK complete — all positions closed, cooldown until {cooldown_end}")
         if trigger_pct is not None:
