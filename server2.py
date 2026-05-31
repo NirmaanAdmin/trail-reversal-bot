@@ -1704,20 +1704,29 @@ def webhook():
             }), 200
 
         # ─── PROFIT-LOCK COOLDOWN GATE ────────────────────────
-        # After an auto-close-all, reject ALL webhooks (including entries)
-        # for COOLDOWN_AFTER_LOCK_SEC seconds. This lets Pine's internal
-        # state drift back into sync before we accept new trades.
-        if in_profit_lock_cooldown():
+        # After an auto-close-all, reject ENTRY and REVERSE webhooks for
+        # COOLDOWN_AFTER_LOCK_SEC seconds so Pine's internal state can
+        # resync before new trades are accepted.
+        # CLOSE and BOOK always pass through — blocking them would orphan
+        # any position that survived the lock (partial fill, race, etc.)
+        # and prevent Pine's sl_wait closes from reaching the server.
+        if in_profit_lock_cooldown() and alert_type in ("entry", "reverse"):
             remaining = cooldown_remaining_sec()
             log.info(f"🔒 COOLDOWN: rejecting {alert_type} for {symbol} — {remaining}s left")
             log_trade_event(symbol, action, alert_type, "COOLDOWN", f"{remaining}s remaining")
             return jsonify({"status": "rejected", "reason": f"profit-lock cooldown ({remaining}s)"}), 200
 
         # ─── LOSS-LOCK COOLDOWN GATE ──────────────────────────
-        # Mirror of the profit-lock gate. After a loss-lock auto-close-all,
-        # reject ALL webhooks for LOSS_LOCK_COOLDOWN_SEC. Same rationale —
-        # let Pine flatten its internal state before we accept new trades.
-        if in_loss_lock_cooldown():
+        # After a loss-lock auto-close-all, reject ENTRY and REVERSE webhooks
+        # for LOSS_LOCK_COOLDOWN_SEC seconds so Pine's internal state can
+        # resync before new trades are accepted.
+        # CLOSE and BOOK always pass through — same reasoning as the
+        # profit-lock gate above. Blocking closes during loss cooldown was
+        # the root cause of the TAO phantom-entry incident (May 31 2026):
+        # Pine's sl_wait close was rejected → the server cleared active_trades
+        # → Pine's wait-bars countdown completed → entry fired into an empty
+        # active_trades → server accepted it. Fix: closes must never be gated.
+        if in_loss_lock_cooldown() and alert_type in ("entry", "reverse"):
             remaining = loss_cooldown_remaining_sec()
             log.info(f"🛑 LOSS COOLDOWN: rejecting {alert_type} for {symbol} — {remaining}s left")
             log_trade_event(symbol, action, alert_type, "LOSS_COOLDOWN", f"{remaining}s remaining")
