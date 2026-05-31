@@ -19,6 +19,41 @@ WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET", "")
 DEFAULT_LEVERAGE = int(os.environ.get("DEFAULT_LEVERAGE", "5"))
 DEFAULT_MARGIN = os.environ.get("DEFAULT_MARGIN", "INR")
 
+# ─── Auth helpers (fail CLOSED, constant-time) ───────────────
+# Every authenticated path (the webhook + all admin endpoints) routes through
+# _secret_ok(). If WEBHOOK_SECRET is unset/empty the check returns False, so a
+# misconfigured deploy REJECTS rather than silently exposing destructive
+# endpoints to the internet. compare_digest avoids a timing side-channel.
+import hmac as _hmac_cmp
+
+if not WEBHOOK_SECRET:
+    logging.getLogger("bot").warning(
+        "⚠️ WEBHOOK_SECRET is empty — ALL authenticated endpoints will reject. "
+        "Set WEBHOOK_SECRET in the environment before going live."
+    )
+
+def _secret_ok(provided):
+    """Constant-time secret check. Fails closed when WEBHOOK_SECRET is unset."""
+    if not WEBHOOK_SECRET:
+        return False
+    if not provided:
+        return False
+    return _hmac_cmp.compare_digest(str(provided), WEBHOOK_SECRET)
+
+def _request_secret():
+    """Pull the secret from the X-Auth-Secret header (preferred — keeps it out
+    of access logs / browser history) or the ?secret= query param (legacy)."""
+    return request.headers.get("X-Auth-Secret") or request.args.get("secret")
+
+def _redact(d):
+    """Copy of a webhook payload with the secret masked, for safe logging."""
+    if not isinstance(d, dict):
+        return d
+    out = dict(d)
+    if "secret" in out:
+        out["secret"] = "***"
+    return out
+
 app = Flask(__name__)
 client = CoinDCXFutures(API_KEY, API_SECRET)
 
@@ -253,6 +288,19 @@ def tick_round_sl(sl_price, entry_price, side, symbol):
 # {symbol: {pair, side, qty, original_qty, entry_price, entry_time,
 #           order_id, tp_price, sl_price, books_done, leverage, margin_ccy}}
 active_trades = {}
+
+# ─── Trade lock ──────────────────────────────────────────────
+# Serializes order-placement + state mutation across the Flask request thread
+# and all background workers (profit-lock, loss-lock, baseline, target). The
+# old "thread-safe via GIL" assumption only holds for SINGLE dict ops; the real
+# sequences here are multi-step (check membership → index → mutate → save) and
+# interleave at bytecode boundaries. Without this, a worker's close_all_positions
+# can clear active_trades between a book handler's `symbol in active_trades` check
+# and its `active_trades[symbol]` access → KeyError (swallowed → silent half-close).
+# RLock (not Lock) so a path already holding it can re-enter without self-deadlock.
+# Held ONLY around mutation + the order calls that must be atomic with it — never
+# across a worker's poll/compute, which would block webhooks for a CoinDCX round-trip.
+_trade_lock = threading.RLock()
 
 # ─── Persist active_trades across container restarts ──────────
 # Without this, a Railway restart wipes the in-memory dict and orphans
@@ -522,7 +570,16 @@ _baseline_history       = []     # list of {timestamp, old_baseline, trigger_equ
 _baseline_cooldown_until = 0.0   # epoch — webhooks rejected (except book/close) until this
 
 FIXED_MARGIN_INR = float(os.environ.get("FIXED_MARGIN_INR", "0"))
-USDT_INR_RATE = float(os.environ.get("USDT_INR_RATE", "98"))
+
+def usdt_inr_rate():
+    """Single source of truth for the USDT→INR rate. Reads env each call so it
+    can be tuned live without a redeploy; ALL P&L and sizing paths go through
+    this one function so they can never drift onto different rates."""
+    try:
+        return float(os.environ.get("USDT_INR_RATE", "98"))
+    except (TypeError, ValueError):
+        return 98.0
+
 WALLET_USAGE_PCT = float(os.environ.get("WALLET_USAGE_PCT", "100")) / 100
 
 # ─── SL LOCKOUT ──────────────────────────────────────────────
@@ -965,8 +1022,9 @@ def compute_net_roe():
             continue
         direction = 1 if side == "buy" else -1
         pnl_usd = (mark - entry) * qty * direction
-        pnl_inr = pnl_usd * float(os.environ.get("USDT_INR_RATE", "98"))
-        margin_inr = (entry * qty / lev) * float(os.environ.get("USDT_INR_RATE", "98"))
+        rate = usdt_inr_rate()
+        pnl_inr = pnl_usd * rate
+        margin_inr = (entry * qty / lev) * rate
         total_pnl += pnl_inr
         total_margin += margin_inr
     if total_margin <= 0:
@@ -1185,118 +1243,119 @@ def close_all_positions(trigger_reason="profit lock", trigger_pct=None, lock_typ
     else:
         _profit_lock_until = time.time() + COOLDOWN_AFTER_LOCK_SEC
 
-    # Query CoinDCX for the actual position state. If this fails, we degrade
-    # gracefully to the tracked qty (legacy behavior); orphan risk returns
-    # for this one lock cycle, but the alternative (skipping the lock
-    # because we can't verify) is worse.
-    real_positions = fetch_real_positions_map()
-    if real_positions is None:
-        log.warning("⚠️ Real-position fetch failed — falling back to tracked qty (orphan risk for this lock)")
-        real_positions = {}
+    with _trade_lock:
+        # Query CoinDCX for the actual position state. If this fails, we degrade
+        # gracefully to the tracked qty (legacy behavior); orphan risk returns
+        # for this one lock cycle, but the alternative (skipping the lock
+        # because we can't verify) is worse.
+        real_positions = fetch_real_positions_map()
+        if real_positions is None:
+            log.warning("⚠️ Real-position fetch failed — falling back to tracked qty (orphan risk for this lock)")
+            real_positions = {}
 
-    # Iterate the union: anything the bot is tracking AND anything CoinDCX
-    # shows as open. This catches orphans on symbols the bot lost track of
-    # (e.g. across the previous deploy crash).
-    symbols_to_close = set(active_trades.keys()) | set(real_positions.keys())
-    for sym in symbols_to_close:
+        # Iterate the union: anything the bot is tracking AND anything CoinDCX
+        # shows as open. This catches orphans on symbols the bot lost track of
+        # (e.g. across the previous deploy crash).
+        symbols_to_close = set(active_trades.keys()) | set(real_positions.keys())
+        for sym in symbols_to_close:
+            try:
+                trade = active_trades.get(sym, {})
+                tracked_qty = float(trade.get("qty", 0) or 0)
+
+                # Prefer the real CoinDCX position size. Fall back to tracked qty
+                # only if the position isn't visible via the API (rare).
+                if sym in real_positions:
+                    close_qty = real_positions[sym]["qty_abs"]
+                    close_side = "sell" if real_positions[sym]["side"] == "buy" else "buy"
+                    lev = real_positions[sym]["leverage"] if not trade else trade.get("leverage", real_positions[sym]["leverage"])
+                    mcy = real_positions[sym]["margin_ccy"] if not trade else trade.get("margin_ccy", real_positions[sym]["margin_ccy"])
+                    if tracked_qty > 0 and abs(close_qty - tracked_qty) > 1e-9:
+                        log.info(f"📐 {sym} qty mismatch — tracked={tracked_qty}, real={close_qty} (using real)")
+                    if not trade:
+                        log.info(f"🧹 {sym} found on CoinDCX but NOT in active_trades — orphan being cleaned up")
+                elif tracked_qty > 0:
+                    # Real fetch failed earlier; fall back to tracker
+                    close_qty = tracked_qty
+                    close_side = "sell" if trade.get("side") == "buy" else "buy"
+                    lev = trade.get("leverage", DEFAULT_LEVERAGE)
+                    mcy = trade.get("margin_ccy", DEFAULT_MARGIN)
+                else:
+                    continue  # tracked but qty=0 and not on exchange — nothing to do
+
+                if close_qty <= 0:
+                    continue
+
+                log.info(f"🔻 LOCK close: {close_side.upper()} {close_qty} {sym}")
+                # Use mark price as the reference for re-rounding on retry. fetch_mark_price
+                # returns a recent value (cached/webhook fallback); if unavailable we use
+                # entry_price since both branches inside the helper only use price as a
+                # fallback heuristic — the cache hit from learning the step is what matters.
+                ref_price = fetch_mark_price(sym) or float(trade.get("entry_price", 0) or 1)
+                result, close_qty = place_order_step_aware(
+                    pair=sym, side=close_side, qty=close_qty, price=ref_price,
+                    leverage=lev, margin_ccy=mcy, label=f"{lock_type}_lock_close"
+                )
+                if isinstance(result, dict) and result.get("status") == "error":
+                    log.warning(f"⚠️ Lock close failed for {sym}: {result.get('message','')}")
+                log_trade_event(sym, close_side,
+                                "loss_lock" if lock_type == "loss" else "profit_lock",
+                                "FILLED", trigger_reason)
+            except Exception as e:
+                log.error(f"❌ Lock close exception for {sym}: {e}", exc_info=True)
+
+        # ─── POST-CLOSE SWEEP ────────────────────────────────────
+        # The step-aware retry rounds DOWN on divisibility errors, which on a
+        # CLOSE leaves the difference behind as an orphan. Wait briefly for
+        # CoinDCX to settle the market orders, then re-query positions. Anything
+        # still open gets a second close attempt — and by now the qty_step_cache
+        # has the correct step (learned from the first reject), so this attempt
+        # uses the right multiple from the start.
         try:
-            trade = active_trades.get(sym, {})
-            tracked_qty = float(trade.get("qty", 0) or 0)
-
-            # Prefer the real CoinDCX position size. Fall back to tracked qty
-            # only if the position isn't visible via the API (rare).
-            if sym in real_positions:
-                close_qty = real_positions[sym]["qty_abs"]
-                close_side = "sell" if real_positions[sym]["side"] == "buy" else "buy"
-                lev = real_positions[sym]["leverage"] if not trade else trade.get("leverage", real_positions[sym]["leverage"])
-                mcy = real_positions[sym]["margin_ccy"] if not trade else trade.get("margin_ccy", real_positions[sym]["margin_ccy"])
-                if tracked_qty > 0 and abs(close_qty - tracked_qty) > 1e-9:
-                    log.info(f"📐 {sym} qty mismatch — tracked={tracked_qty}, real={close_qty} (using real)")
-                if not trade:
-                    log.info(f"🧹 {sym} found on CoinDCX but NOT in active_trades — orphan being cleaned up")
-            elif tracked_qty > 0:
-                # Real fetch failed earlier; fall back to tracker
-                close_qty = tracked_qty
-                close_side = "sell" if trade.get("side") == "buy" else "buy"
-                lev = trade.get("leverage", DEFAULT_LEVERAGE)
-                mcy = trade.get("margin_ccy", DEFAULT_MARGIN)
+            time.sleep(1.5)  # let CoinDCX settle the close orders
+            residual = fetch_real_positions_map()
+            if residual:
+                log.warning(f"⚠️ Post-lock sweep: {len(residual)} position(s) still open: {list(residual.keys())}")
+                for sym, pos in residual.items():
+                    try:
+                        sweep_qty = pos["qty_abs"]
+                        sweep_side = "sell" if pos["side"] == "buy" else "buy"
+                        sweep_lev = pos["leverage"]
+                        sweep_mcy = pos["margin_ccy"]
+                        # Pre-snap to the step grid before sending — qty_step_cache
+                        # should now have the correct value, learned from the first
+                        # pass's rejection (if any).
+                        step = get_qty_step(sym)
+                        if step and step > 0:
+                            decimals = max(0, -math.floor(math.log10(step)))
+                            sweep_qty = round(math.floor(sweep_qty / step) * step, decimals)
+                        if sweep_qty <= 0:
+                            log.warning(f"⚠️ Sweep skipped for {sym} — qty floors to 0 (step={step}, real={pos['qty_abs']})")
+                            continue
+                        log.info(f"🧹 SWEEP close: {sweep_side.upper()} {sweep_qty} {sym}")
+                        ref_price = fetch_mark_price(sym) or 1
+                        result, sweep_qty = place_order_step_aware(
+                            pair=sym, side=sweep_side, qty=sweep_qty, price=ref_price,
+                            leverage=sweep_lev, margin_ccy=sweep_mcy,
+                            label=f"{lock_type}_lock_sweep"
+                        )
+                        if isinstance(result, dict) and result.get("status") == "error":
+                            log.warning(f"⚠️ Sweep close failed for {sym}: {result.get('message','')} — "
+                                        f"manual cleanup may be required")
+                    except Exception as e:
+                        log.error(f"❌ Sweep exception for {sym}: {e}", exc_info=True)
             else:
-                continue  # tracked but qty=0 and not on exchange — nothing to do
-
-            if close_qty <= 0:
-                continue
-
-            log.info(f"🔻 LOCK close: {close_side.upper()} {close_qty} {sym}")
-            # Use mark price as the reference for re-rounding on retry. fetch_mark_price
-            # returns a recent value (cached/webhook fallback); if unavailable we use
-            # entry_price since both branches inside the helper only use price as a
-            # fallback heuristic — the cache hit from learning the step is what matters.
-            ref_price = fetch_mark_price(sym) or float(trade.get("entry_price", 0) or 1)
-            result, close_qty = place_order_step_aware(
-                pair=sym, side=close_side, qty=close_qty, price=ref_price,
-                leverage=lev, margin_ccy=mcy, label=f"{lock_type}_lock_close"
-            )
-            if isinstance(result, dict) and result.get("status") == "error":
-                log.warning(f"⚠️ Lock close failed for {sym}: {result.get('message','')}")
-            log_trade_event(sym, close_side,
-                            "loss_lock" if lock_type == "loss" else "profit_lock",
-                            "FILLED", trigger_reason)
+                log.info("✅ Post-lock sweep: no residual positions found")
         except Exception as e:
-            log.error(f"❌ Lock close exception for {sym}: {e}", exc_info=True)
+            log.error(f"❌ Post-lock sweep error: {e}", exc_info=True)
 
-    # ─── POST-CLOSE SWEEP ────────────────────────────────────
-    # The step-aware retry rounds DOWN on divisibility errors, which on a
-    # CLOSE leaves the difference behind as an orphan. Wait briefly for
-    # CoinDCX to settle the market orders, then re-query positions. Anything
-    # still open gets a second close attempt — and by now the qty_step_cache
-    # has the correct step (learned from the first reject), so this attempt
-    # uses the right multiple from the start.
-    try:
-        time.sleep(1.5)  # let CoinDCX settle the close orders
-        residual = fetch_real_positions_map()
-        if residual:
-            log.warning(f"⚠️ Post-lock sweep: {len(residual)} position(s) still open: {list(residual.keys())}")
-            for sym, pos in residual.items():
-                try:
-                    sweep_qty = pos["qty_abs"]
-                    sweep_side = "sell" if pos["side"] == "buy" else "buy"
-                    sweep_lev = pos["leverage"]
-                    sweep_mcy = pos["margin_ccy"]
-                    # Pre-snap to the step grid before sending — qty_step_cache
-                    # should now have the correct value, learned from the first
-                    # pass's rejection (if any).
-                    step = get_qty_step(sym)
-                    if step and step > 0:
-                        decimals = max(0, -math.floor(math.log10(step)))
-                        sweep_qty = round(math.floor(sweep_qty / step) * step, decimals)
-                    if sweep_qty <= 0:
-                        log.warning(f"⚠️ Sweep skipped for {sym} — qty floors to 0 (step={step}, real={pos['qty_abs']})")
-                        continue
-                    log.info(f"🧹 SWEEP close: {sweep_side.upper()} {sweep_qty} {sym}")
-                    ref_price = fetch_mark_price(sym) or 1
-                    result, sweep_qty = place_order_step_aware(
-                        pair=sym, side=sweep_side, qty=sweep_qty, price=ref_price,
-                        leverage=sweep_lev, margin_ccy=sweep_mcy,
-                        label=f"{lock_type}_lock_sweep"
-                    )
-                    if isinstance(result, dict) and result.get("status") == "error":
-                        log.warning(f"⚠️ Sweep close failed for {sym}: {result.get('message','')} — "
-                                    f"manual cleanup may be required")
-                except Exception as e:
-                    log.error(f"❌ Sweep exception for {sym}: {e}", exc_info=True)
-        else:
-            log.info("✅ Post-lock sweep: no residual positions found")
-    except Exception as e:
-        log.error(f"❌ Post-lock sweep error: {e}", exc_info=True)
-
-    # Cancel native SLs, clear tracking
-    for sym in list(native_sl_orders.keys()):
-        try:
-            cancel_native_sl(sym)
-        except Exception:
-            pass
-    active_trades.clear()
-    _save_active_trades()
+        # Cancel native SLs, clear tracking
+        for sym in list(native_sl_orders.keys()):
+            try:
+                cancel_native_sl(sym)
+            except Exception:
+                pass
+        active_trades.clear()
+        _save_active_trades()
     # Cooldown clock was armed at the TOP of this function (see the big
     # comment block there). Here we just emit the completion log and
     # register with the streak / daily-cap trackers.
@@ -1553,7 +1612,7 @@ def baseline_record_realized_pnl(symbol, entry_price, exit_price, qty, side, lev
             return
         direction = 1 if side == "buy" else -1
         pnl_usd = (exit_ - entry) * q * direction
-        pnl_inr = pnl_usd * USDT_INR_RATE
+        pnl_inr = pnl_usd * usdt_inr_rate()
         _baseline_realized_pnl += pnl_inr
         log.info(f"📐 Realized P&L recorded: {symbol} {side} {q} @ {entry}→{exit_} = "
                  f"₹{pnl_inr:+.2f} | total since baseline: ₹{_baseline_realized_pnl:+.2f}")
@@ -1617,7 +1676,7 @@ def clear_active_trade(pair, reason=""):
 def calc_quantity(coin_price, leverage, symbol=None):
     if FIXED_MARGIN_INR <= 0:
         return 0
-    available_usdt = (FIXED_MARGIN_INR * WALLET_USAGE_PCT) / USDT_INR_RATE
+    available_usdt = (FIXED_MARGIN_INR * WALLET_USAGE_PCT) / usdt_inr_rate()
     raw_qty = (available_usdt * leverage) / coin_price
     return round_down_quantity(raw_qty, coin_price, symbol=symbol)
 
@@ -1663,10 +1722,15 @@ def cancel_native_sl(symbol):
 @app.route("/webhook", methods=["POST"])
 def webhook():
     try:
-        data = request.json or json.loads(request.data.decode("utf-8"))
-        log.info(f"📩 Webhook: {json.dumps(data)}")
+        data = request.get_json(force=True, silent=True)
+        if data is None:
+            try:
+                data = json.loads((request.data or b"{}").decode("utf-8"))
+            except (ValueError, UnicodeDecodeError):
+                return jsonify({"status": "rejected", "reason": "invalid JSON body"}), 200
+        log.info(f"📩 Webhook: {json.dumps(_redact(data))}")
 
-        if WEBHOOK_SECRET and data.get("secret") != WEBHOOK_SECRET:
+        if not _secret_ok(data.get("secret")):
             return jsonify({"error": "unauthorized"}), 401
 
         action = data.get("action", "").lower()
@@ -1791,302 +1855,304 @@ def webhook():
                             "reason": f"target ₹{_target_value:.2f} reached "
                                       f"(current={cur_str})"}), 200
 
-        # ─── ENTRY — initial position ─────────────────────────
-        if alert_type == "entry":
-            if symbol in active_trades:
-                trade = active_trades[symbol]
-                mins = int((time.time() - trade["entry_time"]) // 60)
-                log.info(f"🚫 SKIP entry: {symbol} already active ({mins}m, {trade['side']})")
-                log_trade_event(symbol, action, "entry", "SKIP", f"already active ({mins}m)")
-                return jsonify({"status": "skipped", "reason": "already active"}), 200
-
-            quantity = calc_quantity(coin_price, leverage, symbol=symbol)
-            if quantity <= 0:
-                log.error(f"❌ REJECT: {symbol} — qty=0")
-                log_trade_event(symbol, action, "entry", "REJECT", "qty=0")
-                return jsonify({"status": "rejected", "reason": "qty=0"}), 200
-
-            log.info(f"🚀 ENTRY {action.upper()} {quantity} {symbol} ({leverage}x) | TP={tp_price} SL={sl_price}")
-            result, quantity = place_order_step_aware(
-                pair=symbol, side=action, qty=quantity, price=coin_price,
-                leverage=leverage, margin_ccy=margin_ccy, label="entry"
-            )
-
-            if isinstance(result, dict) and result.get("status") == "error":
-                err = result.get("message", "")
-                log.error(f"❌ REJECT: {symbol} — {err}")
-                log_trade_event(symbol, action, "entry", "REJECT", err)
-                return jsonify({"status": "rejected", "reason": err}), 200
-
-            order_id = result.get("id", "unknown") if isinstance(result, dict) else "unknown"
-            filled_qty = float(result.get("total_quantity", quantity)) if isinstance(result, dict) else quantity
-            set_active_trade(symbol, action, filled_qty, coin_price, order_id,
-                             tp_price=tp_price, sl_price=sl_price,
-                             leverage=leverage, margin_ccy=margin_ccy)
-            log_trade_event(symbol, action, "entry", "FILLED", f"TP={tp_price} SL={sl_price}")
-
-            # Place native SL on CoinDCX as safety net
-            if sl_price:
-                place_native_sl(symbol, action, filled_qty, sl_price, leverage, margin_ccy)
-
-            return jsonify({"status": "success", "order": result}), 200
-
-        # ─── BOOK — Pine says TP hit, execute partial close ───
-        elif alert_type == "book":
-            if symbol not in active_trades:
-                log.info(f"⚠️ SKIP book: {symbol} not tracked")
-                log_trade_event(symbol, action, "book", "SKIP", "not tracked")
-                return jsonify({"status": "skipped"}), 200
-
-            trade = active_trades[symbol]
-            book_qty = round_down_quantity(trade["original_qty"] * book_pct, coin_price, symbol=symbol)
-            book_qty = min(book_qty, trade["qty"])
-
-            if book_qty <= 0:
-                log.info(f"⚠️ SKIP book: {symbol} — book qty too small")
-                return jsonify({"status": "skipped", "reason": "book qty too small"}), 200
-
-            # Cancel old native SL (qty is changing)
-            cancel_native_sl(symbol)
-
-            close_side = "sell" if trade["side"] == "buy" else "buy"
-            log.info(f"📦 BOOK #{trade['books_done']+1}: closing {book_qty} of {trade['qty']} {symbol}")
-
-            result, book_qty = place_order_step_aware(
-                pair=symbol, side=close_side, qty=book_qty, price=coin_price,
-                leverage=leverage, margin_ccy=margin_ccy, label="book"
-            )
-
-            if isinstance(result, dict) and result.get("status") == "error":
-                err = result.get("message", "")
-                log.error(f"❌ Book failed: {symbol} — {err}")
-                log_trade_event(symbol, action, "book", "REJECT", err)
-                # Re-place old SL since book failed
-                if trade.get("sl_price"):
-                    place_native_sl(symbol, trade["side"], trade["qty"], trade["sl_price"], leverage, margin_ccy)
-                return jsonify({"status": "rejected", "reason": err}), 200
-
-            # Update tracked qty and TP/SL from Pine
-            trade["qty"] -= book_qty
-            # Snap to the symbol's qty step to absorb floating-point drift.
-            # Without this, e.g. 0.013 - 0.004 = 0.008999999999999998 in Python,
-            # which CoinDCX then rejects as not divisible by 0.001. The
-            # step-aware retry rounds DOWN to 0.008, leaving 0.001 as a naked
-            # orphan on the exchange. Rounding (not flooring) to the nearest
-            # step undoes float error in both directions and lands us back on
-            # the clean grid (0.008999... → 0.009).
-            step = get_qty_step(symbol)
-            if step and step > 0:
-                decimals = max(0, -math.floor(math.log10(step)))
-                trade["qty"] = round(round(trade["qty"] / step) * step, decimals)
-                if trade["qty"] < 0:
-                    trade["qty"] = 0.0
-            trade["books_done"] += 1
-            if tp_price:
-                trade["tp_price"] = tp_price
-            if sl_price:
-                trade["sl_price"] = sl_price
-            _save_active_trades()
-
-            # Record realized P&L for baseline tracking (partial book)
-            baseline_record_realized_pnl(
-                symbol=symbol,
-                entry_price=trade["entry_price"],
-                exit_price=coin_price,
-                qty=book_qty,
-                side=trade["side"],
-                leverage=leverage
-            )
-
-            log.info(f"✅ Booked {book_qty} {symbol} — remaining: {trade['qty']:.4f} | new TP={tp_price} SL={sl_price}")
-            log_trade_event(symbol, action, "book", "FILLED", f"book #{trade['books_done']}, remaining={trade['qty']:.4f}")
-
-            # Re-place native SL with updated qty and new SL level
-            if trade["qty"] > 0 and sl_price:
-                place_native_sl(symbol, trade["side"], trade["qty"], sl_price, leverage, margin_ccy)
-
-            return jsonify({"status": "booked", "remaining_qty": trade["qty"]}), 200
-
-        # ─── REVERSE — SL hit, close remaining + open opposite ──
-        elif alert_type == "reverse":
-            cancel_native_sl(symbol)
-
-            # Track whether we actually placed a close on the exchange. Only
-            # if we did do we need to wait for the close to settle before
-            # reopening. If the symbol wasn't tracked, there's nothing to
-            # settle and we go straight to the reverse-entry below.
-            close_was_placed = False
-            if symbol in active_trades:
-                trade = active_trades[symbol]
-                close_side = "sell" if trade["side"] == "buy" else "buy"
-                close_qty = trade["qty"]
-
-                if close_qty > 0:
-                    log.info(f"🔻 REVERSE close: {close_side.upper()} {close_qty} {symbol}")
-                    close_result, close_qty = place_order_step_aware(
-                        pair=symbol, side=close_side, qty=close_qty, price=coin_price,
-                        leverage=trade.get("leverage", leverage),
-                        margin_ccy=trade.get("margin_ccy", margin_ccy),
-                        label="reverse_close"
-                    )
-                    close_was_placed = True
-                    if isinstance(close_result, dict) and close_result.get("status") == "error":
-                        err = close_result.get("message", "")
-                        log.warning(f"⚠️ Reverse close failed (likely already closed): {err}")
-
-                # Record realized P&L for baseline tracking (full close on SL)
-                baseline_record_realized_pnl(
-                    symbol=symbol,
-                    entry_price=trade["entry_price"],
-                    exit_price=coin_price,
-                    qty=close_qty,
-                    side=trade["side"],
-                    leverage=leverage
-                )
-
-                clear_active_trade(symbol, "reverse — SL hit")
-                log_trade_event(symbol, close_side, "reverse_close", "FILLED", "Pine reverse")
-
-            # ─── POLL-CONFIRM-FLAT BEFORE REOPEN ──────────────────
-            # Previous behavior: blind `time.sleep(1)` here, then reopen.
-            # 1s wasn't enough during CoinDCX isolated-margin settlement
-            # races — the reopen would lock fresh margin while the close's
-            # margin-release was still in flight, leaving the surviving
-            # position carrying margin from both legs (single position size,
-            # double margin). Real incidents: INJ 2026-05-28, ZEC 2026-05-29,
-            # HYPE 2026-05-29. See wait_for_symbol_flat() docstring for the
-            # forensic detail.
-            #
-            # New behavior: actively poll the exchange until the symbol
-            # reads flat (up to 4s, ~16 polls). If it's still open at the
-            # timeout, ABORT the reopen — the bot stays flat and Pine's
-            # next entry signal will re-enter cleanly. Better one missed
-            # reverse than a stuck double-margin position.
-            #
-            # If we never placed a close (symbol wasn't tracked), skip the
-            # wait entirely — there's nothing to settle.
-            if close_was_placed:
-                flat = wait_for_symbol_flat(symbol, timeout=4.0, poll_interval=0.25)
-                if flat is False:
-                    log.error(f"❌ ABORT reverse reopen for {symbol} — exchange still "
-                              f"shows position open after 4s. Reopening now would "
-                              f"double-lock margin (real-incident pattern). Staying flat; "
-                              f"next Pine signal will re-enter cleanly.")
-                    log_trade_event(symbol, action, "reverse_entry", "ABORT",
-                                    "exchange close did not settle within 4s")
-                    return jsonify({"status": "aborted",
-                                    "reason": f"close on {symbol} did not settle within 4s"}), 200
-                # flat is True (verified flat) or None (API blip mid-poll).
-                # On None we've already waited up to 4s polling — strictly
-                # more conservative than the old blind 1s sleep — so proceed.
-
-            quantity = calc_quantity(coin_price, leverage, symbol=symbol)
-            if quantity <= 0:
-                log.error(f"❌ REJECT reverse entry: {symbol} — qty=0")
-                return jsonify({"status": "rejected", "reason": "reverse entry qty=0"}), 200
-
-            log.info(f"🔄 REVERSE entry: {action.upper()} {quantity} {symbol} | TP={tp_price} SL={sl_price}")
-            result, quantity = place_order_step_aware(
-                pair=symbol, side=action, qty=quantity, price=coin_price,
-                leverage=leverage, margin_ccy=margin_ccy, label="reverse_entry"
-            )
-
-            if isinstance(result, dict) and result.get("status") == "error":
-                err = result.get("message", "")
-                log.error(f"❌ Reverse entry failed: {err}")
-                log_trade_event(symbol, action, "reverse_entry", "REJECT", err)
-                return jsonify({"status": "rejected", "reason": err}), 200
-
-            order_id = result.get("id", "unknown") if isinstance(result, dict) else "unknown"
-            filled_qty = float(result.get("total_quantity", quantity)) if isinstance(result, dict) else quantity
-            set_active_trade(symbol, action, filled_qty, coin_price, order_id,
-                             tp_price=tp_price, sl_price=sl_price,
-                             leverage=leverage, margin_ccy=margin_ccy)
-            log_trade_event(symbol, action, "reverse_entry", "FILLED", f"TP={tp_price} SL={sl_price}")
-
-            if sl_price:
-                place_native_sl(symbol, action, filled_qty, sl_price, leverage, margin_ccy)
-
-            return jsonify({"status": "reversed", "order": result}), 200
-
-        # ─── CLOSE — kill switch / SL-wait close-only ─────────
-        elif alert_type == "close":
-            reason = data.get("reason", "unknown")
-            ret_pct = data.get("return_pct", "?")
-            # Distinguish SL-wait from kill switch in logs
-            if reason == "sl_wait":
-                log.info(f"⏳ SL-WAIT close: {symbol}")
-                # Only arm lockout if we actually held this position. Pine emits
-                # sl_wait for every SL on every watched symbol, but the lockout
-                # is only meaningful for positions the server was tracking —
-                # otherwise we'd block the next legitimate fresh entry on a
-                # symbol we never had a position on in the first place.
+        with _trade_lock:
+            # ─── ENTRY — initial position ─────────────────────────
+            if alert_type == "entry":
                 if symbol in active_trades:
-                    mark_sl_lockout(symbol, reason="Pine sl_wait close on tracked position")
-                else:
-                    log.info(f"⏳ SL-WAIT for {symbol} ignored for lockout — not in active_trades")
-            elif reason == "tp_hit":
-                log.info(f"✓ TP HIT: {symbol} — return={ret_pct}%")
-            elif reason == "sl_hit":
-                log.info(f"✗ SL HIT: {symbol} — return={ret_pct}%")
-            elif reason == "timer_expired":
-                log.info(f"⏱ TIMER EXIT: {symbol} — return={ret_pct}%")
-            elif reason == "kill_switch":
-                log.info(f"☠️ KILL SWITCH: {symbol} — return={ret_pct}%")
-            else:
-                log.info(f"☠️ CLOSE ({reason}): {symbol} — return={ret_pct}%")
+                    trade = active_trades[symbol]
+                    mins = int((time.time() - trade["entry_time"]) // 60)
+                    log.info(f"🚫 SKIP entry: {symbol} already active ({mins}m, {trade['side']})")
+                    log_trade_event(symbol, action, "entry", "SKIP", f"already active ({mins}m)")
+                    return jsonify({"status": "skipped", "reason": "already active"}), 200
 
-            cancel_native_sl(symbol)
+                quantity = calc_quantity(coin_price, leverage, symbol=symbol)
+                if quantity <= 0:
+                    log.error(f"❌ REJECT: {symbol} — qty=0")
+                    log_trade_event(symbol, action, "entry", "REJECT", "qty=0")
+                    return jsonify({"status": "rejected", "reason": "qty=0"}), 200
 
-            if symbol in active_trades:
+                log.info(f"🚀 ENTRY {action.upper()} {quantity} {symbol} ({leverage}x) | TP={tp_price} SL={sl_price}")
+                result, quantity = place_order_step_aware(
+                    pair=symbol, side=action, qty=quantity, price=coin_price,
+                    leverage=leverage, margin_ccy=margin_ccy, label="entry"
+                )
+
+                if isinstance(result, dict) and result.get("status") == "error":
+                    err = result.get("message", "")
+                    log.error(f"❌ REJECT: {symbol} — {err}")
+                    log_trade_event(symbol, action, "entry", "REJECT", err)
+                    return jsonify({"status": "rejected", "reason": err}), 200
+
+                order_id = result.get("id", "unknown") if isinstance(result, dict) else "unknown"
+                filled_qty = float(result.get("total_quantity", quantity)) if isinstance(result, dict) else quantity
+                set_active_trade(symbol, action, filled_qty, coin_price, order_id,
+                                 tp_price=tp_price, sl_price=sl_price,
+                                 leverage=leverage, margin_ccy=margin_ccy)
+                log_trade_event(symbol, action, "entry", "FILLED", f"TP={tp_price} SL={sl_price}")
+
+                # Place native SL on CoinDCX as safety net
+                if sl_price:
+                    place_native_sl(symbol, action, filled_qty, sl_price, leverage, margin_ccy)
+
+                return jsonify({"status": "success", "order": result}), 200
+
+            # ─── BOOK — Pine says TP hit, execute partial close ───
+            elif alert_type == "book":
+                if symbol not in active_trades:
+                    log.info(f"⚠️ SKIP book: {symbol} not tracked")
+                    log_trade_event(symbol, action, "book", "SKIP", "not tracked")
+                    return jsonify({"status": "skipped"}), 200
+
                 trade = active_trades[symbol]
-                close_qty = trade["qty"]
+                book_qty = round_down_quantity(trade["original_qty"] * book_pct, coin_price, symbol=symbol)
+                book_qty = min(book_qty, trade["qty"])
+
+                if book_qty <= 0:
+                    log.info(f"⚠️ SKIP book: {symbol} — book qty too small")
+                    return jsonify({"status": "skipped", "reason": "book qty too small"}), 200
+
+                # Cancel old native SL (qty is changing)
+                cancel_native_sl(symbol)
+
                 close_side = "sell" if trade["side"] == "buy" else "buy"
+                log.info(f"📦 BOOK #{trade['books_done']+1}: closing {book_qty} of {trade['qty']} {symbol}")
 
-                if close_qty > 0:
-                    reason_label = {
-                        "sl_wait": "SL-WAIT",
-                        "tp_hit": "TP",
-                        "sl_hit": "SL",
-                        "timer_expired": "TIMER",
-                        "kill_switch": "KILL",
-                    }.get(reason, reason.upper())
-                    log.info(f"🔻 {reason_label} close: "
-                             f"{close_side.upper()} {close_qty} {symbol}")
-                    result, close_qty = place_order_step_aware(
-                        pair=symbol, side=close_side, qty=close_qty, price=coin_price,
-                        leverage=trade.get("leverage", leverage),
-                        margin_ccy=trade.get("margin_ccy", margin_ccy),
-                        label=f"close_{reason}"
-                    )
-                    if isinstance(result, dict) and result.get("status") == "error":
-                        log.warning(f"⚠️ Close may have failed: {result.get('message','')}")
+                result, book_qty = place_order_step_aware(
+                    pair=symbol, side=close_side, qty=book_qty, price=coin_price,
+                    leverage=trade.get("leverage", leverage),
+                    margin_ccy=trade.get("margin_ccy", margin_ccy), label="book"
+                )
 
-                # Record realized P&L for baseline tracking
+                if isinstance(result, dict) and result.get("status") == "error":
+                    err = result.get("message", "")
+                    log.error(f"❌ Book failed: {symbol} — {err}")
+                    log_trade_event(symbol, action, "book", "REJECT", err)
+                    # Re-place old SL since book failed
+                    if trade.get("sl_price"):
+                        place_native_sl(symbol, trade["side"], trade["qty"], trade["sl_price"], leverage, margin_ccy)
+                    return jsonify({"status": "rejected", "reason": err}), 200
+
+                # Update tracked qty and TP/SL from Pine
+                trade["qty"] -= book_qty
+                # Snap to the symbol's qty step to absorb floating-point drift.
+                # Without this, e.g. 0.013 - 0.004 = 0.008999999999999998 in Python,
+                # which CoinDCX then rejects as not divisible by 0.001. The
+                # step-aware retry rounds DOWN to 0.008, leaving 0.001 as a naked
+                # orphan on the exchange. Rounding (not flooring) to the nearest
+                # step undoes float error in both directions and lands us back on
+                # the clean grid (0.008999... → 0.009).
+                step = get_qty_step(symbol)
+                if step and step > 0:
+                    decimals = max(0, -math.floor(math.log10(step)))
+                    trade["qty"] = round(round(trade["qty"] / step) * step, decimals)
+                    if trade["qty"] < 0:
+                        trade["qty"] = 0.0
+                trade["books_done"] += 1
+                if tp_price:
+                    trade["tp_price"] = tp_price
+                if sl_price:
+                    trade["sl_price"] = sl_price
+                _save_active_trades()
+
+                # Record realized P&L for baseline tracking (partial book)
                 baseline_record_realized_pnl(
                     symbol=symbol,
                     entry_price=trade["entry_price"],
                     exit_price=coin_price,
-                    qty=close_qty,
+                    qty=book_qty,
                     side=trade["side"],
                     leverage=leverage
                 )
 
-                clear_active_trade(symbol, f"{reason}")
-                log_trade_event(symbol, close_side,
-                                reason if reason in ("sl_wait", "tp_hit", "sl_hit", "timer_expired", "kill_switch") else "close",
-                                "FILLED",
-                                f"reason={reason}")
+                log.info(f"✅ Booked {book_qty} {symbol} — remaining: {trade['qty']:.4f} | new TP={tp_price} SL={sl_price}")
+                log_trade_event(symbol, action, "book", "FILLED", f"book #{trade['books_done']}, remaining={trade['qty']:.4f}")
+
+                # Re-place native SL with updated qty and new SL level
+                if trade["qty"] > 0 and sl_price:
+                    place_native_sl(symbol, trade["side"], trade["qty"], sl_price, leverage, margin_ccy)
+
+                return jsonify({"status": "booked", "remaining_qty": trade["qty"]}), 200
+
+            # ─── REVERSE — SL hit, close remaining + open opposite ──
+            elif alert_type == "reverse":
+                cancel_native_sl(symbol)
+
+                # Track whether we actually placed a close on the exchange. Only
+                # if we did do we need to wait for the close to settle before
+                # reopening. If the symbol wasn't tracked, there's nothing to
+                # settle and we go straight to the reverse-entry below.
+                close_was_placed = False
+                if symbol in active_trades:
+                    trade = active_trades[symbol]
+                    close_side = "sell" if trade["side"] == "buy" else "buy"
+                    close_qty = trade["qty"]
+
+                    if close_qty > 0:
+                        log.info(f"🔻 REVERSE close: {close_side.upper()} {close_qty} {symbol}")
+                        close_result, close_qty = place_order_step_aware(
+                            pair=symbol, side=close_side, qty=close_qty, price=coin_price,
+                            leverage=trade.get("leverage", leverage),
+                            margin_ccy=trade.get("margin_ccy", margin_ccy),
+                            label="reverse_close"
+                        )
+                        close_was_placed = True
+                        if isinstance(close_result, dict) and close_result.get("status") == "error":
+                            err = close_result.get("message", "")
+                            log.warning(f"⚠️ Reverse close failed (likely already closed): {err}")
+
+                    # Record realized P&L for baseline tracking (full close on SL)
+                    baseline_record_realized_pnl(
+                        symbol=symbol,
+                        entry_price=trade["entry_price"],
+                        exit_price=coin_price,
+                        qty=close_qty,
+                        side=trade["side"],
+                        leverage=leverage
+                    )
+
+                    clear_active_trade(symbol, "reverse — SL hit")
+                    log_trade_event(symbol, close_side, "reverse_close", "FILLED", "Pine reverse")
+
+                # ─── POLL-CONFIRM-FLAT BEFORE REOPEN ──────────────────
+                # Previous behavior: blind `time.sleep(1)` here, then reopen.
+                # 1s wasn't enough during CoinDCX isolated-margin settlement
+                # races — the reopen would lock fresh margin while the close's
+                # margin-release was still in flight, leaving the surviving
+                # position carrying margin from both legs (single position size,
+                # double margin). Real incidents: INJ 2026-05-28, ZEC 2026-05-29,
+                # HYPE 2026-05-29. See wait_for_symbol_flat() docstring for the
+                # forensic detail.
+                #
+                # New behavior: actively poll the exchange until the symbol
+                # reads flat (up to 4s, ~16 polls). If it's still open at the
+                # timeout, ABORT the reopen — the bot stays flat and Pine's
+                # next entry signal will re-enter cleanly. Better one missed
+                # reverse than a stuck double-margin position.
+                #
+                # If we never placed a close (symbol wasn't tracked), skip the
+                # wait entirely — there's nothing to settle.
+                if close_was_placed:
+                    flat = wait_for_symbol_flat(symbol, timeout=4.0, poll_interval=0.25)
+                    if flat is False:
+                        log.error(f"❌ ABORT reverse reopen for {symbol} — exchange still "
+                                  f"shows position open after 4s. Reopening now would "
+                                  f"double-lock margin (real-incident pattern). Staying flat; "
+                                  f"next Pine signal will re-enter cleanly.")
+                        log_trade_event(symbol, action, "reverse_entry", "ABORT",
+                                        "exchange close did not settle within 4s")
+                        return jsonify({"status": "aborted",
+                                        "reason": f"close on {symbol} did not settle within 4s"}), 200
+                    # flat is True (verified flat) or None (API blip mid-poll).
+                    # On None we've already waited up to 4s polling — strictly
+                    # more conservative than the old blind 1s sleep — so proceed.
+
+                quantity = calc_quantity(coin_price, leverage, symbol=symbol)
+                if quantity <= 0:
+                    log.error(f"❌ REJECT reverse entry: {symbol} — qty=0")
+                    return jsonify({"status": "rejected", "reason": "reverse entry qty=0"}), 200
+
+                log.info(f"🔄 REVERSE entry: {action.upper()} {quantity} {symbol} | TP={tp_price} SL={sl_price}")
+                result, quantity = place_order_step_aware(
+                    pair=symbol, side=action, qty=quantity, price=coin_price,
+                    leverage=leverage, margin_ccy=margin_ccy, label="reverse_entry"
+                )
+
+                if isinstance(result, dict) and result.get("status") == "error":
+                    err = result.get("message", "")
+                    log.error(f"❌ Reverse entry failed: {err}")
+                    log_trade_event(symbol, action, "reverse_entry", "REJECT", err)
+                    return jsonify({"status": "rejected", "reason": err}), 200
+
+                order_id = result.get("id", "unknown") if isinstance(result, dict) else "unknown"
+                filled_qty = float(result.get("total_quantity", quantity)) if isinstance(result, dict) else quantity
+                set_active_trade(symbol, action, filled_qty, coin_price, order_id,
+                                 tp_price=tp_price, sl_price=sl_price,
+                                 leverage=leverage, margin_ccy=margin_ccy)
+                log_trade_event(symbol, action, "reverse_entry", "FILLED", f"TP={tp_price} SL={sl_price}")
+
+                if sl_price:
+                    place_native_sl(symbol, action, filled_qty, sl_price, leverage, margin_ccy)
+
+                return jsonify({"status": "reversed", "order": result}), 200
+
+            # ─── CLOSE — kill switch / SL-wait close-only ─────────
+            elif alert_type == "close":
+                reason = data.get("reason", "unknown")
+                ret_pct = data.get("return_pct", "?")
+                # Distinguish SL-wait from kill switch in logs
+                if reason == "sl_wait":
+                    log.info(f"⏳ SL-WAIT close: {symbol}")
+                    # Only arm lockout if we actually held this position. Pine emits
+                    # sl_wait for every SL on every watched symbol, but the lockout
+                    # is only meaningful for positions the server was tracking —
+                    # otherwise we'd block the next legitimate fresh entry on a
+                    # symbol we never had a position on in the first place.
+                    if symbol in active_trades:
+                        mark_sl_lockout(symbol, reason="Pine sl_wait close on tracked position")
+                    else:
+                        log.info(f"⏳ SL-WAIT for {symbol} ignored for lockout — not in active_trades")
+                elif reason == "tp_hit":
+                    log.info(f"✓ TP HIT: {symbol} — return={ret_pct}%")
+                elif reason == "sl_hit":
+                    log.info(f"✗ SL HIT: {symbol} — return={ret_pct}%")
+                elif reason == "timer_expired":
+                    log.info(f"⏱ TIMER EXIT: {symbol} — return={ret_pct}%")
+                elif reason == "kill_switch":
+                    log.info(f"☠️ KILL SWITCH: {symbol} — return={ret_pct}%")
+                else:
+                    log.info(f"☠️ CLOSE ({reason}): {symbol} — return={ret_pct}%")
+
+                cancel_native_sl(symbol)
+
+                if symbol in active_trades:
+                    trade = active_trades[symbol]
+                    close_qty = trade["qty"]
+                    close_side = "sell" if trade["side"] == "buy" else "buy"
+
+                    if close_qty > 0:
+                        reason_label = {
+                            "sl_wait": "SL-WAIT",
+                            "tp_hit": "TP",
+                            "sl_hit": "SL",
+                            "timer_expired": "TIMER",
+                            "kill_switch": "KILL",
+                        }.get(reason, reason.upper())
+                        log.info(f"🔻 {reason_label} close: "
+                                 f"{close_side.upper()} {close_qty} {symbol}")
+                        result, close_qty = place_order_step_aware(
+                            pair=symbol, side=close_side, qty=close_qty, price=coin_price,
+                            leverage=trade.get("leverage", leverage),
+                            margin_ccy=trade.get("margin_ccy", margin_ccy),
+                            label=f"close_{reason}"
+                        )
+                        if isinstance(result, dict) and result.get("status") == "error":
+                            log.warning(f"⚠️ Close may have failed: {result.get('message','')}")
+
+                    # Record realized P&L for baseline tracking
+                    baseline_record_realized_pnl(
+                        symbol=symbol,
+                        entry_price=trade["entry_price"],
+                        exit_price=coin_price,
+                        qty=close_qty,
+                        side=trade["side"],
+                        leverage=leverage
+                    )
+
+                    clear_active_trade(symbol, f"{reason}")
+                    log_trade_event(symbol, close_side,
+                                    reason if reason in ("sl_wait", "tp_hit", "sl_hit", "timer_expired", "kill_switch") else "close",
+                                    "FILLED",
+                                    f"reason={reason}")
+                else:
+                    log.info(f"⚠️ Close for {symbol} but not tracked — no action needed")
+                    log_trade_event(symbol, action,
+                                    reason if reason in ("sl_wait", "tp_hit", "sl_hit", "timer_expired", "kill_switch") else "close",
+                                    "SKIP", "not tracked")
+
+                return jsonify({"status": "closed", "symbol": symbol, "reason": reason}), 200
+
             else:
-                log.info(f"⚠️ Close for {symbol} but not tracked — no action needed")
-                log_trade_event(symbol, action,
-                                reason if reason in ("sl_wait", "tp_hit", "sl_hit", "timer_expired", "kill_switch") else "close",
-                                "SKIP", "not tracked")
-
-            return jsonify({"status": "closed", "symbol": symbol, "reason": reason}), 200
-
-        else:
-            return jsonify({"status": "unknown_type", "type": alert_type}), 200
+                return jsonify({"status": "unknown_type", "type": alert_type}), 200
 
     except Exception as e:
         log.error(f"❌ Error: {e}", exc_info=True)
@@ -2098,6 +2164,11 @@ def webhook():
 # ═══════════════════════════════════════════════════════════
 @app.route("/status", methods=["GET"])
 def status():
+    # AUTH REQUIRED: /status returns the full active_trades book (symbols, sizes,
+    # entries, and exact SL levels) plus risk config. On a public URL that's a
+    # stop-hunting surface, so it's gated. Pass ?secret= or the X-Auth-Secret header.
+    if not _secret_ok(_request_secret()):
+        return jsonify({"status": "error", "reason": "invalid or missing secret"}), 403
     pnl, margin, pct = compute_net_roe()
     pct_str = f"{pct:.2f}" if pct is not None else "unavailable"
     _check_and_reset_daily_counter()  # ensure counter reflects current IST date
@@ -2179,7 +2250,7 @@ def profit_lock_force():
     """Manually trigger close-all-and-lock (for emergencies / testing).
     Requires ?secret=... matching WEBHOOK_SECRET.
     Computes current net% and contributes it to the daily cap counter."""
-    if WEBHOOK_SECRET and request.args.get("secret") != WEBHOOK_SECRET:
+    if not _secret_ok(_request_secret()):
         return jsonify({"error": "unauthorized"}), 401
     if not active_trades:
         return jsonify({"status": "no_positions", "active": 0})
@@ -2217,7 +2288,7 @@ def loss_lock_force():
     """Manually trigger close-all-and-loss-lock (for emergencies / testing).
     Requires ?secret=... matching WEBHOOK_SECRET. Does NOT bump the daily-cap
     counter (consistent with the auto loss-lock — daily cap is profit-only)."""
-    if WEBHOOK_SECRET and request.args.get("secret") != WEBHOOK_SECRET:
+    if not _secret_ok(_request_secret()):
         return jsonify({"error": "unauthorized"}), 401
     if not active_trades:
         return jsonify({"status": "no_positions", "active": 0})
@@ -2239,7 +2310,7 @@ def daily_cap_reset():
     Requires ?secret=... matching WEBHOOK_SECRET.
     Does NOT clear active_trades or affect the profit-lock cooldown."""
     global _daily_locked_pct_sum, _daily_lock_count, _daily_paused, _daily_counter_date
-    if WEBHOOK_SECRET and request.args.get("secret") != WEBHOOK_SECRET:
+    if not _secret_ok(_request_secret()):
         return jsonify({"error": "unauthorized"}), 401
     prev_sum = _daily_locked_pct_sum
     prev_count = _daily_lock_count
@@ -2309,7 +2380,7 @@ def streak_pause_reset():
     Does NOT affect active_trades, profit-lock cooldown, or daily cap.
     Requires ?secret=... matching WEBHOOK_SECRET."""
     global _streak_profit_lock_count, _streak_pause_until
-    if WEBHOOK_SECRET and request.args.get("secret") != WEBHOOK_SECRET:
+    if not _secret_ok(_request_secret()):
         return jsonify({"error": "unauthorized"}), 401
     prev_count = _streak_profit_lock_count
     prev_paused = in_streak_pause()
@@ -2389,7 +2460,7 @@ def clear_tracking():
     Tab-reload damage scope: at worst, ONE symbol's bot tracking is cleared.
     Native SL on CoinDCX continues to protect the position. The bot will pick
     up the symbol again on the next Pine entry alert."""
-    if WEBHOOK_SECRET and request.args.get("secret") != WEBHOOK_SECRET:
+    if not _secret_ok(_request_secret()):
         return jsonify({"status": "error", "reason": "invalid or missing secret"}), 403
     symbol = request.args.get("symbol")
     if not symbol:
@@ -2430,7 +2501,7 @@ def reconcile_endpoint():
 
     Bookmarkable:
       https://your-app.up.railway.app/reconcile?secret=YOUR_SECRET"""
-    if WEBHOOK_SECRET and request.args.get("secret") != WEBHOOK_SECRET:
+    if not _secret_ok(_request_secret()):
         return jsonify({"error": "unauthorized"}), 401
     before = list(active_trades.keys())
     real = fetch_real_positions_map()
@@ -2474,7 +2545,7 @@ def sl_lockout_status():
 def sl_lockout_clear():
     """Manually clear SL lockouts. ?symbol=X clears one, no arg clears all.
     Requires ?secret=... matching WEBHOOK_SECRET."""
-    if WEBHOOK_SECRET and request.args.get("secret") != WEBHOOK_SECRET:
+    if not _secret_ok(_request_secret()):
         return jsonify({"error": "unauthorized"}), 401
     symbol = request.args.get("symbol")
     if symbol:
@@ -2520,7 +2591,7 @@ def target_set():
     current wallet value, the hit flag is cleared and trading resumes.
     Requires ?value=N&secret=... ."""
     global _target_value, _target_hit, _target_hit_at
-    if WEBHOOK_SECRET and request.args.get("secret") != WEBHOOK_SECRET:
+    if not _secret_ok(_request_secret()):
         return jsonify({"error": "unauthorized"}), 401
     raw = request.args.get("value")
     if raw is None:
@@ -2558,7 +2629,7 @@ def target_clear():
     """Disable the target system entirely (sets value to 0, clears hit flag).
     Requires ?secret=... ."""
     global _target_value, _target_hit, _target_hit_at
-    if WEBHOOK_SECRET and request.args.get("secret") != WEBHOOK_SECRET:
+    if not _secret_ok(_request_secret()):
         return jsonify({"error": "unauthorized"}), 401
     old_value = _target_value
     _target_value = 0.0
@@ -2611,7 +2682,7 @@ def baseline_status():
 
 @app.route("/baseline/set", methods=["POST", "GET"])
 def baseline_set():
-    if request.args.get("secret") != WEBHOOK_SECRET:
+    if not _secret_ok(_request_secret()):
         return jsonify({"error": "unauthorized"}), 401
     raw = request.args.get("value")
     if raw is None:
@@ -2640,7 +2711,7 @@ def baseline_set():
 
 @app.route("/baseline/reset", methods=["POST", "GET"])
 def baseline_reset():
-    if request.args.get("secret") != WEBHOOK_SECRET:
+    if not _secret_ok(_request_secret()):
         return jsonify({"error": "unauthorized"}), 401
     global _baseline_inr, _baseline_realized_pnl, _baseline_lock_count
     global _baseline_last_lock_at, _baseline_history, _baseline_cooldown_until
@@ -2657,9 +2728,12 @@ def baseline_reset():
 
 @app.route("/health", methods=["GET"])
 def health():
+    # Public, unauthenticated uptime probe. Deliberately leaks NO position
+    # detail (symbol list/sizes/SLs are sensitive) — counts only. Use the
+    # auth'd /status for the full book.
     return jsonify({
-        "status": "ok", "positions": len(active_trades),
-        "active": list(active_trades.keys()),
+        "status": "ok",
+        "positions": len(active_trades),
         "time": datetime.now().isoformat()
     })
 
