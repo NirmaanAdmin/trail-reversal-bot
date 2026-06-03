@@ -309,10 +309,19 @@ _trade_lock = threading.RLock()
 ACTIVE_TRADES_FILE = os.environ.get("ACTIVE_TRADES_FILE", "/app/data/active_trades.json")
 
 def _save_active_trades():
+    # Atomic write: dump to a temp file in the same dir, fsync, then
+    # os.replace() over the live file. os.replace is atomic on the same
+    # filesystem, so a worker killed mid-write (gunicorn WORKER TIMEOUT)
+    # truncates the .tmp file — never the live file. Prevents the
+    # "active_trades file empty — starting fresh" orphan-everything boot.
     try:
         os.makedirs(os.path.dirname(ACTIVE_TRADES_FILE), exist_ok=True)
-        with open(ACTIVE_TRADES_FILE, "w") as f:
+        tmp = f"{ACTIVE_TRADES_FILE}.tmp"
+        with open(tmp, "w") as f:
             json.dump(active_trades, f)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, ACTIVE_TRADES_FILE)
     except Exception as e:
         log.warning(f"⚠️ Failed to persist active_trades: {e}")
 
@@ -688,6 +697,46 @@ def fetch_real_wallet_inr():
         return None
     except Exception as e:
         log.warning(f"target: wallet fetch failed: {e}")
+        return None
+
+
+# ─── MARGIN GATE — skip entries we can't fund ────────────────
+# When the wallet is fully committed across open positions, every new
+# entry signal otherwise fires 2 blocking POSTs only to get CoinDCX
+# "Insufficient funds". Under TradingView bursts that serial pile of
+# doomed calls is what blocks the single gunicorn worker past its
+# timeout and drives the worker-kill / respawn churn. This gate asks
+# CoinDCX for the FREE INR balance (the 'balance' field only, excluding
+# locked margin already deployed) and skips the entry locally when
+# there isn't enough to fund it. Fails OPEN: a wallet-fetch hiccup
+# never blocks trading — the order just falls through as before.
+MARGIN_GATE_ENABLED    = os.environ.get("MARGIN_GATE_ENABLED", "true").lower() == "true"
+MARGIN_GATE_BUFFER_INR = float(os.environ.get("MARGIN_GATE_BUFFER_INR", "20"))
+MARGIN_GATE_CACHE_TTL  = float(os.environ.get("MARGIN_GATE_CACHE_TTL", "5"))
+_avail_inr_cache = {"value": None, "ts": 0.0}
+
+def fetch_available_inr(force=False):
+    """Free (available) INR futures margin = wallet 'balance' field only,
+    excluding locked_balance already in positions. Short TTL cache so a
+    burst of entry webhooks doesn't fire a signed GET each. Returns float
+    or None on failure (caller treats None as fail-open)."""
+    now = time.time()
+    if (not force and _avail_inr_cache["value"] is not None
+            and (now - _avail_inr_cache["ts"]) < MARGIN_GATE_CACHE_TTL):
+        return _avail_inr_cache["value"]
+    try:
+        resp = _signed_get("/exchange/v1/derivatives/futures/wallets")
+        if resp.status_code != 200:
+            return None
+        for w in resp.json():
+            if w.get("currency_short_name") == "INR":
+                avail = float(w.get("balance", 0) or 0)
+                _avail_inr_cache["value"] = avail
+                _avail_inr_cache["ts"]    = now
+                return avail
+        return None
+    except Exception as e:
+        log.warning(f"margin-gate: wallet fetch failed: {e}")
         return None
 
 
@@ -1865,6 +1914,20 @@ def webhook():
                     log_trade_event(symbol, action, "entry", "SKIP", f"already active ({mins}m)")
                     return jsonify({"status": "skipped", "reason": "already active"}), 200
 
+                # ─── MARGIN GATE — skip unfundable entries locally ───
+                # Avoids firing 2 doomed blocking POSTs (the serial pile
+                # that drives gunicorn WORKER TIMEOUT) when the wallet is
+                # already fully committed. Fail-open: None = don't block.
+                if MARGIN_GATE_ENABLED and FIXED_MARGIN_INR > 0:
+                    required_inr = FIXED_MARGIN_INR * WALLET_USAGE_PCT
+                    avail_inr = fetch_available_inr()
+                    if avail_inr is not None and avail_inr < required_inr + MARGIN_GATE_BUFFER_INR:
+                        log.info(f"🚧 SKIP entry: {symbol} — free margin ₹{avail_inr:.2f} "
+                                 f"< need ₹{required_inr:.2f} + ₹{MARGIN_GATE_BUFFER_INR:.0f} buffer")
+                        log_trade_event(symbol, action, "entry", "SKIP",
+                                        f"low margin ₹{avail_inr:.2f}<₹{required_inr:.2f}")
+                        return jsonify({"status": "skipped", "reason": "insufficient free margin"}), 200
+
                 quantity = calc_quantity(coin_price, leverage, symbol=symbol)
                 if quantity <= 0:
                     log.error(f"❌ REJECT: {symbol} — qty=0")
@@ -1888,6 +1951,7 @@ def webhook():
                 set_active_trade(symbol, action, filled_qty, coin_price, order_id,
                                  tp_price=tp_price, sl_price=sl_price,
                                  leverage=leverage, margin_ccy=margin_ccy)
+                _avail_inr_cache["ts"] = 0.0  # margin just changed — force re-check on next entry
                 log_trade_event(symbol, action, "entry", "FILLED", f"TP={tp_price} SL={sl_price}")
 
                 # Place native SL on CoinDCX as safety net
