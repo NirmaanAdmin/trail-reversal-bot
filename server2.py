@@ -579,6 +579,11 @@ _baseline_history       = []     # list of {timestamp, old_baseline, trigger_equ
 _baseline_cooldown_until = 0.0   # epoch — webhooks rejected (except book/close) until this
 
 FIXED_MARGIN_INR = float(os.environ.get("FIXED_MARGIN_INR", "0"))
+# Hard ceiling on the number of distinct symbols held at once. A fresh entry
+# on a NEW symbol is rejected once this many positions are already open.
+# 0 = unlimited (no behaviour change). Read at boot — change via Railway env
+# then restart, same as the other gate constants.
+MAX_POSITIONS = int(os.environ.get("MAX_POSITIONS", "0"))
 
 def usdt_inr_rate():
     """Single source of truth for the USDT→INR rate. Reads env each call so it
@@ -1914,6 +1919,23 @@ def webhook():
                     log_trade_event(symbol, action, "entry", "SKIP", f"already active ({mins}m)")
                     return jsonify({"status": "skipped", "reason": "already active"}), 200
 
+                # ─── POSITION CAP — hard ceiling on concurrent symbols ───
+                # A fresh entry on a NEW symbol is rejected once the bot already
+                # holds MAX_POSITIONS distinct symbols. Re-entries on a tracked
+                # symbol (handled just above) and reverses (1-for-1 flips on an
+                # existing symbol) are NOT counted — they don't add a position.
+                # Inside _trade_lock, so the count can't race another entry.
+                # 0 = unlimited.
+                if MAX_POSITIONS > 0 and len(active_trades) >= MAX_POSITIONS:
+                    log.info(f"🧮 POSITION CAP: rejecting entry for {symbol} — "
+                             f"{len(active_trades)}/{MAX_POSITIONS} open "
+                             f"[{', '.join(active_trades.keys())}]")
+                    log_trade_event(symbol, action, "entry", "POS_CAP",
+                                    f"{len(active_trades)}/{MAX_POSITIONS}")
+                    return jsonify({"status": "rejected",
+                                    "reason": f"position cap reached "
+                                              f"({len(active_trades)}/{MAX_POSITIONS})"}), 200
+
                 # ─── MARGIN GATE — skip unfundable entries locally ───
                 # Avoids firing 2 doomed blocking POSTs (the serial pile
                 # that drives gunicorn WORKER TIMEOUT) when the wallet is
@@ -2240,6 +2262,11 @@ def status():
         "active_trades": active_trades,
         "native_sl_orders": native_sl_orders,
         "positions": len(active_trades),
+        "max_positions": {
+            "cap": MAX_POSITIONS,
+            "open": len(active_trades),
+            "at_cap": (MAX_POSITIONS > 0 and len(active_trades) >= MAX_POSITIONS),
+        },
         "profit_lock": {
             "enabled": PROFIT_LOCK_ENABLED,
             "threshold_pct": PROFIT_LOCK_PCT,
