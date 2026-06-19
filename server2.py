@@ -1946,10 +1946,110 @@ def webhook():
             if alert_type == "entry":
                 if symbol in active_trades:
                     trade = active_trades[symbol]
-                    mins = int((time.time() - trade["entry_time"]) // 60)
-                    log.info(f"🚫 SKIP entry: {symbol} already active ({mins}m, {trade['side']})")
-                    log_trade_event(symbol, action, "entry", "SKIP", f"already active ({mins}m)")
-                    return jsonify({"status": "skipped", "reason": "already active"}), 200
+                    # ─── SKIP unless this is a flip on the new architecture ───
+                    # Skip a repeat entry when it's the SAME direction (don't stack),
+                    # OR when SERVER_EXITS_ENABLED is off. The flip path below is the
+                    # entry-only-Pine behavior (opposite entry = close+reopen); it is
+                    # coupled to SERVER_EXITS_ENABLED so an account NOT yet cut over to
+                    # entry-only Pine keeps the old "skip if already active" rule
+                    # exactly — provably dormant, no entry-handler behavior change
+                    # until SERVER_EXITS_ENABLED is flipped true on that account.
+                    if action == trade["side"] or not SERVER_EXITS_ENABLED:
+                        mins = int((time.time() - trade["entry_time"]) // 60)
+                        why = "same dir" if action == trade["side"] else "server-exits off"
+                        log.info(f"🚫 SKIP entry: {symbol} already active "
+                                 f"({mins}m, {trade['side']}, {why})")
+                        log_trade_event(symbol, action, "entry", "SKIP",
+                                        f"already active ({mins}m, {why})")
+                        return jsonify({"status": "skipped",
+                                        "reason": f"already active ({why})"}), 200
+
+                    # ─── OPPOSITE DIRECTION — Pine-driven reverse (flip) ──
+                    # Entry-only Pine no longer sends a `reverse` webhook; a flip
+                    # arrives as an opposite-direction ENTRY. Honour the agreed rule
+                    # "opposite Pine entry = close-current-open-new": flatten the
+                    # existing leg, confirm flat on the exchange before reopening
+                    # (never double-margin-lock — same guard the reverse branch
+                    # uses), then open the new direction and let the ladder re-arm
+                    # fresh on its next poll. Self-contained on purpose: mirrors the
+                    # trusted reverse path without touching it, and skips the margin
+                    # gate (the close just freed equivalent margin, and the avail
+                    # cache would read stale pre-close — exactly why the reverse
+                    # reopen has no margin gate either).
+                    flip_prev_side  = trade["side"]
+                    flip_entry_px   = trade["entry_price"]
+                    flip_close_side = "sell" if flip_prev_side == "buy" else "buy"
+                    flip_close_qty  = trade["qty"]
+                    log.info(f"🔄 FLIP: {symbol} {flip_prev_side.upper()}→{action.upper()} "
+                             f"(opposite-direction Pine entry)")
+                    cancel_native_sl(symbol)
+                    if flip_close_qty > 0:
+                        log.info(f"🔻 FLIP close: {flip_close_side.upper()} {flip_close_qty} {symbol}")
+                        flip_result, flip_close_qty = place_order_step_aware(
+                            pair=symbol, side=flip_close_side, qty=flip_close_qty,
+                            price=coin_price, leverage=trade.get("leverage", leverage),
+                            margin_ccy=trade.get("margin_ccy", margin_ccy),
+                            label="flip_close"
+                        )
+                        if isinstance(flip_result, dict) and flip_result.get("status") == "error":
+                            log.warning(f"⚠️ Flip close failed (likely already closed): "
+                                        f"{flip_result.get('message','')}")
+
+                    # Record realized P&L on the closed leg for baseline tracking.
+                    baseline_record_realized_pnl(
+                        symbol=symbol, entry_price=flip_entry_px, exit_price=coin_price,
+                        qty=flip_close_qty, side=flip_prev_side, leverage=leverage
+                    )
+                    clear_active_trade(symbol, f"flip {flip_prev_side}→{action}")
+                    log_trade_event(symbol, flip_close_side, "flip_close", "FILLED",
+                                    f"{flip_prev_side}→{action}")
+
+                    # Poll-confirm flat before reopening (up to 4s, ~16 polls). If
+                    # the close hasn't settled, ABORT the reopen — stay flat and let
+                    # Pine's next entry re-enter cleanly. Better a missed flip than a
+                    # double-margin-locked position (INJ/ZEC/HYPE pattern).
+                    flat = wait_for_symbol_flat(symbol, timeout=4.0, poll_interval=0.25)
+                    if flat is False:
+                        log.error(f"❌ ABORT flip reopen for {symbol} — exchange still shows "
+                                  f"position open after 4s. Reopening now would double-lock "
+                                  f"margin. Staying flat; next Pine entry re-enters cleanly.")
+                        log_trade_event(symbol, action, "flip_entry", "ABORT",
+                                        "close did not settle within 4s")
+                        return jsonify({"status": "aborted",
+                                        "reason": f"flip close on {symbol} did not settle within 4s"}), 200
+                    # flat True (verified) or None (API blip after ≥4s polling) → proceed.
+
+                    # Reopen in the new direction. Sizes/tracks like a fresh entry;
+                    # ladder arms on its next poll. No margin gate (see above).
+                    quantity = calc_quantity(coin_price, leverage, symbol=symbol)
+                    if quantity <= 0:
+                        log.error(f"❌ REJECT flip entry: {symbol} — qty=0")
+                        log_trade_event(symbol, action, "flip_entry", "REJECT", "qty=0")
+                        return jsonify({"status": "rejected", "reason": "flip entry qty=0"}), 200
+
+                    log.info(f"🔄 FLIP entry: {action.upper()} {quantity} {symbol} "
+                             f"| TP={tp_price} SL={sl_price}")
+                    result, quantity = place_order_step_aware(
+                        pair=symbol, side=action, qty=quantity, price=coin_price,
+                        leverage=leverage, margin_ccy=margin_ccy, label="flip_entry"
+                    )
+                    if isinstance(result, dict) and result.get("status") == "error":
+                        err = result.get("message", "")
+                        log.error(f"❌ Flip entry failed: {err}")
+                        log_trade_event(symbol, action, "flip_entry", "REJECT", err)
+                        return jsonify({"status": "rejected", "reason": err}), 200
+
+                    order_id = result.get("id", "unknown") if isinstance(result, dict) else "unknown"
+                    filled_qty = float(result.get("total_quantity", quantity)) if isinstance(result, dict) else quantity
+                    set_active_trade(symbol, action, filled_qty, coin_price, order_id,
+                                     tp_price=tp_price, sl_price=sl_price,
+                                     leverage=leverage, margin_ccy=margin_ccy)
+                    log_trade_event(symbol, action, "flip_entry", "FILLED",
+                                    f"{flip_prev_side}→{action} TP={tp_price} SL={sl_price}")
+                    if sl_price:
+                        place_native_sl(symbol, action, filled_qty, sl_price, leverage, margin_ccy)
+                    return jsonify({"status": "flipped", "from": flip_prev_side,
+                                    "to": action, "order": result}), 200
 
                 # ─── POSITION CAP — hard ceiling on concurrent symbols ───
                 # A fresh entry on a NEW symbol is rejected once the bot already
@@ -3215,6 +3315,10 @@ _server_exit_thread = threading.Thread(target=server_exit_worker, daemon=True)
 _server_exit_thread.start()
 log.info(f"🛡️ Server-exit initialized — enabled={SERVER_EXITS_ENABLED}, "
          f"SL={SL_PCT}%, poll={EXIT_POLL_SEC}s")
+# Pine-flip on opposite-direction entry is coupled to SERVER_EXITS_ENABLED (see the
+# entry handler). Log it so the build is confirmable from the boot line.
+log.info(f"🔄 Pine-flip on opposite entry: {'ON' if SERVER_EXITS_ENABLED else 'OFF'} "
+         f"(close-current-open-new; gated on SERVER_EXITS_ENABLED)")
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
