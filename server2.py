@@ -585,6 +585,26 @@ FIXED_MARGIN_INR = float(os.environ.get("FIXED_MARGIN_INR", "0"))
 # then restart, same as the other gate constants.
 MAX_POSITIONS = int(os.environ.get("MAX_POSITIONS", "0"))
 
+# ── Server-owned exits — PHASE 1: hard SL leg (poll-driven) ──────────────────
+# When SERVER_EXITS_ENABLED=true the server owns the stop-loss: a background
+# thread polls the public mark feed every EXIT_POLL_SEC and flattens any tracked
+# position whose mark has crossed entry ± SL_PCT. This pairs with the ENTRY-ONLY
+# Pine (which sends no SL/book/close). PHASE 1 IS SL ONLY — no partial books, no
+# trailing yet (those grow onto the same worker in phase 2/3).
+#
+# DARK BY DEFAULT: SERVER_EXITS_ENABLED defaults false ⇒ the worker idles and
+# changes nothing on deploy. Only flip it true on an account that is
+# SIMULTANEOUSLY switched to the ENTRY-ONLY Pine — otherwise Pine's own SL and
+# this one both fire (harmless duplicate closes, but pointless). SL_PCT is the
+# price distance from entry (e.g. 3.0 → −3% long stop, ≈ −15% ROE at 5x).
+SERVER_EXITS_ENABLED = os.environ.get("SERVER_EXITS_ENABLED", "false").lower() == "true"
+SL_PCT               = float(os.environ.get("SL_PCT", "3.0"))        # price % from entry
+EXIT_POLL_SEC        = float(os.environ.get("EXIT_POLL_SEC", "5"))   # 3–10s recommended
+
+_server_exit_last_check_at = None
+_server_exit_last_error    = None
+_server_exit_closes        = 0      # count of positions the SL leg has flattened
+
 def usdt_inr_rate():
     """Single source of truth for the USDT→INR rate. Reads env each call so it
     can be tuned live without a redeploy; ALL P&L and sizing paths go through
@@ -2061,6 +2081,28 @@ def webhook():
 
             # ─── REVERSE — SL hit, close remaining + open opposite ──
             elif alert_type == "reverse":
+                # ─── POSITION CAP on REVERSE ──────────────────────────
+                # A reverse for a symbol we are NOT tracking is a net-new
+                # position: there's nothing to close, so the opposite leg below
+                # opens fresh. Without this guard a flip on a symbol whose
+                # ENTRY was cap-rejected re-enters through the reverse door and
+                # pushes us over the ceiling (observed: tracker hit 6/5 when a
+                # cap-rejected FET fired a reverse). Gate it exactly like a
+                # fresh entry. A reverse on a TRACKED symbol is a 1-for-1 flip
+                # (net zero) and passes untouched. Inside _trade_lock, so the
+                # count can't race. 0 = unlimited.
+                if (MAX_POSITIONS > 0 and symbol not in active_trades
+                        and len(active_trades) >= MAX_POSITIONS):
+                    log.info(f"🧮 POSITION CAP (reverse): rejecting {symbol} — "
+                             f"{len(active_trades)}/{MAX_POSITIONS} open, symbol "
+                             f"untracked [{', '.join(active_trades.keys())}]")
+                    log_trade_event(symbol, action, "reverse", "POS_CAP",
+                                    f"{len(active_trades)}/{MAX_POSITIONS} untracked")
+                    return jsonify({"status": "rejected",
+                                    "reason": f"position cap reached "
+                                              f"({len(active_trades)}/{MAX_POSITIONS}), "
+                                              f"reverse on untracked {symbol}"}), 200
+
                 cancel_native_sl(symbol)
 
                 # Track whether we actually placed a close on the exchange. Only
@@ -2266,6 +2308,15 @@ def status():
             "cap": MAX_POSITIONS,
             "open": len(active_trades),
             "at_cap": (MAX_POSITIONS > 0 and len(active_trades) >= MAX_POSITIONS),
+        },
+        "server_exits": {
+            "enabled": SERVER_EXITS_ENABLED,
+            "phase": "sl_only",
+            "sl_pct": SL_PCT,
+            "poll_sec": EXIT_POLL_SEC,
+            "closes_total": _server_exit_closes,
+            "last_check_at": _server_exit_last_check_at,
+            "last_error": _server_exit_last_error,
         },
         "profit_lock": {
             "enabled": PROFIT_LOCK_ENABLED,
@@ -2853,6 +2904,159 @@ log.info(f"📐 Baseline initialized — enabled={BASELINE_ENABLED}, "
          f"current=₹{_baseline_inr if _baseline_inr is not None else 'unset'}, "
          f"trigger={BASELINE_TRIGGER_PCT}%, rollover={BASELINE_ROLLOVER_PCT}%")
 
+# ═══════════════════════════════════════════════════════════════════════════
+#  SERVER-OWNED EXITS — PHASE 1: hard SL leg (poll-driven)
+#
+#  Self-gates on SERVER_EXITS_ENABLED (default false ⇒ idle/dark). When live it
+#  polls the public futures mark feed every EXIT_POLL_SEC and flattens any
+#  tracked position whose mark has crossed entry ± SL_PCT.
+#
+#  On breach: close the FULL REAL position size (step-aware), clear tracking, go
+#  FLAT. It does NOT reverse (the next ENTRY-ONLY Pine signal drives direction),
+#  does NOT arm any lockout, and does NOT enter any cooldown. Closes bypass the
+#  webhook gates — they only ever reduce exposure. The SL level is computed from
+#  SL_PCT off the stored entry price (fully server-owned, independent of
+#  whatever Pine sends) and is STATIC in phase 1 (books/trail are phase 2/3).
+# ═══════════════════════════════════════════════════════════════════════════
+def _fetch_all_marks():
+    """One fresh bulk pull of the public futures mark feed.
+    Returns {symbol: mark_float} or None on failure. Also refreshes
+    _ticker_cache so the profit/loss-lock workers ride the same poll."""
+    try:
+        resp = _req.get(
+            "https://public.coindcx.com/market_data/v3/current_prices/futures/rt",
+            timeout=5,
+        )
+        if resp.status_code != 200:
+            return None
+        prices = (resp.json() or {}).get("prices")
+        if not isinstance(prices, dict):
+            return None
+        now = time.time()
+        out = {}
+        for sym, row in prices.items():
+            if not isinstance(row, dict):
+                continue
+            px_raw = row.get("mp")
+            if px_raw is None:
+                px_raw = row.get("ls")
+            if px_raw is None:
+                px_raw = row.get("last_price")
+            if px_raw is None:
+                continue
+            try:
+                px = float(px_raw)
+            except (TypeError, ValueError):
+                continue
+            if px <= 0:
+                continue
+            out[sym] = px
+            _ticker_cache[sym] = (px, now)
+        return out or None
+    except Exception as e:
+        log.debug(f"server-exit mark fetch failed: {e}")
+        return None
+
+
+def _sl_level(side, entry):
+    """Static phase-1 SL price: entry ∓ SL_PCT. Long stop below, short above."""
+    if not entry or entry <= 0:
+        return None
+    if side == "buy":
+        return entry * (1.0 - SL_PCT / 100.0)
+    return entry * (1.0 + SL_PCT / 100.0)
+
+
+def _sl_breached(side, mark, sl):
+    """Long breaches at/below the stop; short breaches at/above it."""
+    if not sl or sl <= 0 or not mark or mark <= 0:
+        return False
+    return mark <= sl if side == "buy" else mark >= sl
+
+
+def server_exit_close(sym, mark):
+    """Flatten ONE position whose SL breached. Closes the real exchange size,
+    step-aware, under _trade_lock. No reverse, no lockout, no cooldown."""
+    global _server_exit_closes
+    with _trade_lock:
+        trade = active_trades.get(sym)
+        if not trade:
+            return  # a webhook / circuit-breaker handled it between detect and lock
+        side  = trade.get("side", "")
+        entry = float(trade.get("entry_price", 0) or 0)
+        sl    = _sl_level(side, entry)
+        if not _sl_breached(side, mark, sl):
+            return  # recovered before we acquired the lock — leave it open
+
+        real = fetch_real_positions_map()
+        if real is None:
+            log.warning(f"🛡️ SERVER-SL {sym}: positions fetch failed — deferring to next poll")
+            return  # don't act blind; retry next cycle
+        pos = real.get(sym)
+        if not pos:
+            # Tracked but flat on the exchange → just drop the stale tracker.
+            clear_active_trade(sym, "server-sl: exchange already flat")
+            return
+
+        close_qty  = pos["qty_abs"]
+        close_side = "sell" if pos["side"] == "buy" else "buy"
+        lev = trade.get("leverage", pos["leverage"])
+        mcy = trade.get("margin_ccy", pos["margin_ccy"])
+        log.warning(
+            f"🛡️ SERVER-SL BREACH: {sym} {side.upper()} mark={mark} crossed "
+            f"SL={sl:.8f} (entry={entry}, {SL_PCT}%) — flatten {close_side.upper()} {close_qty}"
+        )
+        result, close_qty = place_order_step_aware(
+            pair=sym, side=close_side, qty=close_qty, price=mark,
+            leverage=lev, margin_ccy=mcy, label="server_sl_close",
+        )
+        if isinstance(result, dict) and result.get("status") == "error":
+            log.warning(
+                f"⚠️ SERVER-SL close failed for {sym}: {result.get('message','')} "
+                f"— keeping tracker, retry next poll"
+            )
+            return  # keep tracking so we retry; never orphan on a failed close
+        clear_active_trade(sym, "server-sl breach")
+        log_trade_event(sym, close_side, "server_sl", "FILLED", f"mark={mark} sl={sl:.8f}")
+        _server_exit_closes += 1
+        log.info(f"🛡️ SERVER-SL closed {sym} (total server-sl closes: {_server_exit_closes})")
+
+
+def server_exit_worker():
+    """PHASE 1 (SL only): every EXIT_POLL_SEC, flatten any tracked position whose
+    mark crossed entry ± SL_PCT. Self-gates on SERVER_EXITS_ENABLED."""
+    global _server_exit_last_check_at, _server_exit_last_error
+    log.info(
+        f"🛡️ Server-exit (SL leg) thread started — enabled={SERVER_EXITS_ENABLED}, "
+        f"SL={SL_PCT}%, poll={EXIT_POLL_SEC}s"
+    )
+    while True:
+        try:
+            time.sleep(EXIT_POLL_SEC)
+            if not SERVER_EXITS_ENABLED or not active_trades:
+                continue
+            marks = _fetch_all_marks()
+            _server_exit_last_check_at = datetime.now(timezone.utc).isoformat()
+            if marks is None:
+                _server_exit_last_error = "mark fetch failed"
+                continue
+            _server_exit_last_error = None
+            for sym in list(active_trades.keys()):
+                trade = active_trades.get(sym)
+                if not trade:
+                    continue
+                side  = trade.get("side", "")
+                entry = float(trade.get("entry_price", 0) or 0)
+                mark  = marks.get(sym)
+                if mark is None or entry <= 0:
+                    continue
+                if _sl_breached(side, mark, _sl_level(side, entry)):
+                    server_exit_close(sym, mark)
+        except Exception as e:
+            _server_exit_last_error = str(e)
+            log.error(f"server_exit_worker error: {e}", exc_info=True)
+
+
 # Start the profit-lock monitor thread (unconditional — it self-gates on the
 # PROFIT_LOCK_ENABLED env var so you can flip it without a redeploy).
 _profit_lock_thread = threading.Thread(target=profit_lock_worker, daemon=True)
@@ -2882,6 +3086,13 @@ log.info(f"🎯 Target initialized — enabled={TARGET_ENABLED}, "
 # so it's orphan-proof.
 _target_thread = threading.Thread(target=target_worker, daemon=True)
 _target_thread.start()
+
+# Start the server-owned exit worker (PHASE 1: SL leg). Unconditional launch;
+# self-gates on SERVER_EXITS_ENABLED (default false ⇒ idle/dark, zero change).
+_server_exit_thread = threading.Thread(target=server_exit_worker, daemon=True)
+_server_exit_thread.start()
+log.info(f"🛡️ Server-exit initialized — enabled={SERVER_EXITS_ENABLED}, "
+         f"SL={SL_PCT}%, poll={EXIT_POLL_SEC}s")
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
