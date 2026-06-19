@@ -607,6 +607,9 @@ EXIT_POLL_SEC        = float(os.environ.get("EXIT_POLL_SEC", "5"))   # 3–10s r
 TP_STEP_PCT          = float(os.environ.get("TP_STEP_PCT", "4.0"))   # rung spacing, price %
 BOOK_PCT             = float(os.environ.get("BOOK_PCT", "33.0"))     # % of ORIGINAL per book
 MAX_BOOKS            = int(os.environ.get("MAX_BOOKS", "2"))         # books before pure trail
+# Per-cycle heartbeat: when true, every armed symbol logs mark/avg/profit%/k/books/sl
+# each poll so the ladder's view is observable live instead of inferred. Default off.
+LADDER_VERBOSE       = os.environ.get("LADDER_VERBOSE", "false").lower() == "true"
 
 _server_exit_last_check_at = None
 _server_exit_last_error    = None
@@ -2321,6 +2324,8 @@ def status():
         "server_exits": {
             "enabled": SERVER_EXITS_ENABLED,
             "phase": "full_ladder",
+            "mark_source": "rt_feed",
+            "verbose": LADDER_VERBOSE,
             "sl_pct": SL_PCT,
             "tp_step_pct": TP_STEP_PCT,
             "book_pct": BOOK_PCT,
@@ -3034,10 +3039,14 @@ def _ladder_close(sym, close_side, qty, price, lev, mcy, reason):
     return True, used
 
 
-def _ladder_step(sym, pos):
+def _ladder_step(sym, pos, mark):
     """One ladder evaluation for one symbol, under _trade_lock.
-    `pos` is the real position dict from fetch_real_positions_map, or None if the
-    symbol isn't on the exchange yet (entry lag) / already flat.
+    `pos` is the real position dict from fetch_real_positions_map (source of the
+    real avg fill + real open size), or None if the symbol isn't on the exchange
+    yet (entry lag) / already flat. `mark` is the LIVE price from the public rt
+    feed (_fetch_all_marks) — NOT the positions-endpoint mark_price, which proved
+    stale/intermittent and silently froze the rungs. avg+qty come from the
+    positions snapshot (correct); price comes from the rt feed (fresh).
 
     Order each cycle:
       1. ARM on first confirmation — anchor to the REAL avg fill (overwrites the
@@ -3055,7 +3064,7 @@ def _ladder_step(sym, pos):
             return  # not tracked, or not confirmed on the exchange yet
         side    = pos["side"]
         avg     = float(pos.get("avg_price", 0) or 0)
-        mark    = float(pos.get("mark_price", 0) or 0)
+        mark    = float(mark or 0)                 # LIVE rt-feed price (passed in)
         qty_abs = float(pos.get("qty_abs", 0) or 0)
         lev     = trade.get("leverage", pos["leverage"])
         mcy     = trade.get("margin_ccy", pos["margin_ccy"])
@@ -3096,6 +3105,11 @@ def _ladder_step(sym, pos):
 
         # ── 3. ADVANCE — books at rungs, then ratchet trail ───
         k = _rungs_crossed(side, mark, avg)
+        if LADDER_VERBOSE:
+            prof = ((mark - avg) / avg if side == "buy" else (avg - mark) / avg) * 100.0
+            log.info(f"🪜 ladder[{sym}] {side} mark={mark} avg={avg} "
+                     f"prof={prof:+.2f}% roe≈{prof*float(lev):+.1f}% k={k} "
+                     f"books={books}/{MAX_BOOKS} sl={cur_sl:.8f}")
         target_books = min(MAX_BOOKS, k)
         remaining  = qty_abs
         booked_any = False
@@ -3145,15 +3159,19 @@ def server_exit_worker():
             time.sleep(EXIT_POLL_SEC)
             if not SERVER_EXITS_ENABLED or not active_trades:
                 continue
-            real = fetch_real_positions_map()
+            real  = fetch_real_positions_map()
+            marks = _fetch_all_marks()
             _server_exit_last_check_at = datetime.now(timezone.utc).isoformat()
             if real is None:
                 _server_exit_last_error = "positions fetch failed"
                 continue
+            if not marks:
+                _server_exit_last_error = "mark feed fetch failed"
+                continue
             _server_exit_last_error = None
             for sym in list(active_trades.keys()):
                 try:
-                    _ladder_step(sym, real.get(sym))
+                    _ladder_step(sym, real.get(sym), marks.get(sym))
                 except Exception as e:
                     log.error(f"ladder step error for {sym}: {e}", exc_info=True)
         except Exception as e:
