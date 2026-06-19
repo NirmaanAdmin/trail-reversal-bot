@@ -600,6 +600,13 @@ MAX_POSITIONS = int(os.environ.get("MAX_POSITIONS", "0"))
 SERVER_EXITS_ENABLED = os.environ.get("SERVER_EXITS_ENABLED", "false").lower() == "true"
 SL_PCT               = float(os.environ.get("SL_PCT", "3.0"))        # price % from entry
 EXIT_POLL_SEC        = float(os.environ.get("EXIT_POLL_SEC", "5"))   # 3–10s recommended
+# Full-ladder knobs (used when SERVER_EXITS_ENABLED): arithmetic TP rungs off the
+# real avg fill; book BOOK_PCT of the ORIGINAL size at each of the first MAX_BOOKS
+# rungs; after that, pure trail — SL ratchets to one rung behind the highest rung
+# crossed, never loosening. Fixed by design: 4% rungs, 3% stop, 33%×2 books.
+TP_STEP_PCT          = float(os.environ.get("TP_STEP_PCT", "4.0"))   # rung spacing, price %
+BOOK_PCT             = float(os.environ.get("BOOK_PCT", "33.0"))     # % of ORIGINAL per book
+MAX_BOOKS            = int(os.environ.get("MAX_BOOKS", "2"))         # books before pure trail
 
 _server_exit_last_check_at = None
 _server_exit_last_error    = None
@@ -849,6 +856,8 @@ def fetch_real_positions_map():
                 "leverage": lev,
                 "margin_ccy": mcy,
                 "active_pos": qty,
+                "avg_price": float(p.get("avg_price", 0) or 0),
+                "mark_price": float(p.get("mark_price", 0) or 0),
             }
         return result
     except Exception as e:
@@ -2311,8 +2320,11 @@ def status():
         },
         "server_exits": {
             "enabled": SERVER_EXITS_ENABLED,
-            "phase": "sl_only",
+            "phase": "full_ladder",
             "sl_pct": SL_PCT,
+            "tp_step_pct": TP_STEP_PCT,
+            "book_pct": BOOK_PCT,
+            "max_books": MAX_BOOKS,
             "poll_sec": EXIT_POLL_SEC,
             "closes_total": _server_exit_closes,
             "last_check_at": _server_exit_last_check_at,
@@ -2974,84 +2986,176 @@ def _sl_breached(side, mark, sl):
     return mark <= sl if side == "buy" else mark >= sl
 
 
-def server_exit_close(sym, mark):
-    """Flatten ONE position whose SL breached. Closes the real exchange size,
-    step-aware, under _trade_lock. No reverse, no lockout, no cooldown."""
+def _rungs_crossed(side, mark, avg):
+    """How many whole TP_STEP_PCT rungs the mark has moved INTO PROFIT off avg.
+    Long: price above avg. Short: price below avg. 0 if not yet in profit."""
+    if avg <= 0 or mark <= 0:
+        return 0
+    prof = (mark - avg) / avg if side == "buy" else (avg - mark) / avg
+    if prof <= 0:
+        return 0
+    return int(math.floor(prof / (TP_STEP_PCT / 100.0)))
+
+
+def _ladder_sl_target(side, avg, k):
+    """SL price implied by k rungs crossed:
+        k <= 0 → initial stop, avg ∓ SL_PCT
+        k == 1 → breakeven (avg)
+        k >= 2 → one rung behind the highest crossed: avg ± TP_STEP_PCT*(k-1)
+    Long adds, short subtracts. Matches the fixed ladder
+    (entry → −3% / BE / +4% / then trail one 4% rung behind)."""
+    if k <= 0:
+        return _sl_level(side, avg)
+    step = TP_STEP_PCT / 100.0
+    if side == "buy":
+        return avg * (1.0 + step * (k - 1))
+    return avg * (1.0 - step * (k - 1))
+
+
+def _ratchet_sl(side, cur_sl, target):
+    """SL only ever moves toward profit — up for long, down for short. Never loosens."""
+    if cur_sl is None:
+        return target
+    if target is None:
+        return cur_sl
+    return max(cur_sl, target) if side == "buy" else min(cur_sl, target)
+
+
+def _ladder_close(sym, close_side, qty, price, lev, mcy, reason):
+    """Step-aware reduce order. Returns (ok, qty_used). ok=False on exchange error
+    so the caller can keep the tracker and retry next poll (never orphan)."""
+    result, used = place_order_step_aware(
+        pair=sym, side=close_side, qty=qty, price=price,
+        leverage=lev, margin_ccy=mcy, label=reason,
+    )
+    if isinstance(result, dict) and result.get("status") == "error":
+        log.warning(f"⚠️ ladder {reason} failed for {sym}: {result.get('message','')}")
+        return False, used
+    return True, used
+
+
+def _ladder_step(sym, pos):
+    """One ladder evaluation for one symbol, under _trade_lock.
+    `pos` is the real position dict from fetch_real_positions_map, or None if the
+    symbol isn't on the exchange yet (entry lag) / already flat.
+
+    Order each cycle:
+      1. ARM on first confirmation — anchor to the REAL avg fill (overwrites the
+         Pine seed), capture the real opened size, set SL to the initial stop.
+      2. BREACH CHECK against the committed (ratcheted) SL → flatten all remaining,
+         go flat. No reverse — Pine's next entry drives direction.
+      3. ADVANCE — book BOOK_PCT of original at each new rung up to MAX_BOOKS
+         (catches up multiple rungs if price gapped), then ratchet the trailing SL
+         to one rung behind the highest rung crossed. SL never loosens.
+    """
     global _server_exit_closes
     with _trade_lock:
         trade = active_trades.get(sym)
-        if not trade:
-            return  # a webhook / circuit-breaker handled it between detect and lock
-        side  = trade.get("side", "")
-        entry = float(trade.get("entry_price", 0) or 0)
-        sl    = _sl_level(side, entry)
-        if not _sl_breached(side, mark, sl):
-            return  # recovered before we acquired the lock — leave it open
-
-        real = fetch_real_positions_map()
-        if real is None:
-            log.warning(f"🛡️ SERVER-SL {sym}: positions fetch failed — deferring to next poll")
-            return  # don't act blind; retry next cycle
-        pos = real.get(sym)
-        if not pos:
-            # Tracked but flat on the exchange → just drop the stale tracker.
-            clear_active_trade(sym, "server-sl: exchange already flat")
+        if not trade or not pos:
+            return  # not tracked, or not confirmed on the exchange yet
+        side    = pos["side"]
+        avg     = float(pos.get("avg_price", 0) or 0)
+        mark    = float(pos.get("mark_price", 0) or 0)
+        qty_abs = float(pos.get("qty_abs", 0) or 0)
+        lev     = trade.get("leverage", pos["leverage"])
+        mcy     = trade.get("margin_ccy", pos["margin_ccy"])
+        if avg <= 0 or mark <= 0 or qty_abs <= 0:
             return
 
-        close_qty  = pos["qty_abs"]
-        close_side = "sell" if pos["side"] == "buy" else "buy"
-        lev = trade.get("leverage", pos["leverage"])
-        mcy = trade.get("margin_ccy", pos["margin_ccy"])
-        log.warning(
-            f"🛡️ SERVER-SL BREACH: {sym} {side.upper()} mark={mark} crossed "
-            f"SL={sl:.8f} (entry={entry}, {SL_PCT}%) — flatten {close_side.upper()} {close_qty}"
-        )
-        result, close_qty = place_order_step_aware(
-            pair=sym, side=close_side, qty=close_qty, price=mark,
-            leverage=lev, margin_ccy=mcy, label="server_sl_close",
-        )
-        if isinstance(result, dict) and result.get("status") == "error":
-            log.warning(
-                f"⚠️ SERVER-SL close failed for {sym}: {result.get('message','')} "
-                f"— keeping tracker, retry next poll"
-            )
-            return  # keep tracking so we retry; never orphan on a failed close
-        clear_active_trade(sym, "server-sl breach")
-        log_trade_event(sym, close_side, "server_sl", "FILLED", f"mark={mark} sl={sl:.8f}")
-        _server_exit_closes += 1
-        log.info(f"🛡️ SERVER-SL closed {sym} (total server-sl closes: {_server_exit_closes})")
+        # ── 1. ARM on first confirmation ──────────────────────
+        if not trade.get("avg_entry"):
+            trade["avg_entry"]       = avg
+            trade["ladder_orig_qty"] = qty_abs
+            trade["ladder_books"]    = 0
+            trade["ladder_sl"]       = _sl_level(side, avg)
+            trade["entry_price"]     = avg          # keep human-visible entry honest
+            _save_active_trades()
+            log.info(f"🪜 LADDER armed: {sym} {side.upper()} avg={avg} qty={qty_abs} "
+                     f"SL0={trade['ladder_sl']:.8f} (−{SL_PCT}% / +{SL_PCT}%)")
+
+        avg    = float(trade["avg_entry"])
+        cur_sl = float(trade["ladder_sl"])
+        books  = int(trade.get("ladder_books", 0))
+        orig   = float(trade.get("ladder_orig_qty", qty_abs))
+        close_side = "sell" if side == "buy" else "buy"
+
+        # ── 2. BREACH CHECK FIRST (committed stop) ────────────
+        if _sl_breached(side, mark, cur_sl):
+            reason = "server_sl" if books == 0 else "server_trail_sl"
+            log.warning(f"🛡️ LADDER STOP: {sym} {side.upper()} mark={mark} hit SL={cur_sl:.8f} "
+                        f"(books={books}) — flatten {close_side.upper()} {qty_abs}")
+            ok, _ = _ladder_close(sym, close_side, qty_abs, mark, lev, mcy, reason)
+            if not ok:
+                return  # keep tracker, retry next poll — never orphan
+            clear_active_trade(sym, f"ladder stop (books={books})")
+            log_trade_event(sym, close_side, reason, "FILLED",
+                            f"mark={mark} sl={cur_sl:.8f} books={books}")
+            _server_exit_closes += 1
+            log.info(f"🛡️ LADDER closed {sym} (total ladder closes: {_server_exit_closes})")
+            return
+
+        # ── 3. ADVANCE — books at rungs, then ratchet trail ───
+        k = _rungs_crossed(side, mark, avg)
+        target_books = min(MAX_BOOKS, k)
+        remaining  = qty_abs
+        booked_any = False
+        while books < target_books and remaining > 0:
+            book_qty = round_down_quantity(orig * (BOOK_PCT / 100.0), mark, symbol=sym)
+            book_qty = min(book_qty, remaining)
+            if book_qty <= 0:
+                break
+            log.info(f"🪜 LADDER BOOK #{books+1}/{MAX_BOOKS}: {sym} close {close_side.upper()} "
+                     f"{book_qty} of {remaining} (rung {books+1}, mark={mark})")
+            ok, used = _ladder_close(sym, close_side, book_qty, mark, lev, mcy,
+                                     f"server_book_{books+1}")
+            if not ok:
+                break  # retry this book next poll; don't advance the counter
+            remaining -= used
+            books += 1
+            booked_any = True
+            log_trade_event(sym, close_side, "server_book", "FILLED",
+                            f"book #{books} qty={used} remaining≈{remaining:.8f}")
+
+        target_sl = _ladder_sl_target(side, avg, k)
+        new_sl    = _ratchet_sl(side, cur_sl, target_sl)
+
+        if booked_any:
+            trade["ladder_books"] = books
+            trade["qty"] = remaining            # keep tracked qty sane for /status
+        if new_sl != cur_sl:
+            log.info(f"🪜 LADDER trail: {sym} SL {cur_sl:.8f} → {new_sl:.8f} "
+                     f"(rungs={k}, books={books})")
+            trade["ladder_sl"] = new_sl
+        if booked_any or new_sl != cur_sl:
+            _save_active_trades()
 
 
 def server_exit_worker():
-    """PHASE 1 (SL only): every EXIT_POLL_SEC, flatten any tracked position whose
-    mark crossed entry ± SL_PCT. Self-gates on SERVER_EXITS_ENABLED."""
+    """Server-owned exit ladder (SL + partial books + ratcheting trail). Every
+    EXIT_POLL_SEC it pulls one positions snapshot from CoinDCX and evaluates the
+    ladder per tracked symbol. Self-gates on SERVER_EXITS_ENABLED (default false
+    ⇒ idle/dark). The anchor is the exchange's real avg fill (read here, not at
+    entry), so rungs/stop measure off the actual fill, not Pine's signal price."""
     global _server_exit_last_check_at, _server_exit_last_error
-    log.info(
-        f"🛡️ Server-exit (SL leg) thread started — enabled={SERVER_EXITS_ENABLED}, "
-        f"SL={SL_PCT}%, poll={EXIT_POLL_SEC}s"
-    )
+    log.info(f"🪜 Server-exit (full ladder) started — enabled={SERVER_EXITS_ENABLED}, "
+             f"SL={SL_PCT}% TP_STEP={TP_STEP_PCT}% BOOK={BOOK_PCT}%×{MAX_BOOKS} "
+             f"poll={EXIT_POLL_SEC}s")
     while True:
         try:
             time.sleep(EXIT_POLL_SEC)
             if not SERVER_EXITS_ENABLED or not active_trades:
                 continue
-            marks = _fetch_all_marks()
+            real = fetch_real_positions_map()
             _server_exit_last_check_at = datetime.now(timezone.utc).isoformat()
-            if marks is None:
-                _server_exit_last_error = "mark fetch failed"
+            if real is None:
+                _server_exit_last_error = "positions fetch failed"
                 continue
             _server_exit_last_error = None
             for sym in list(active_trades.keys()):
-                trade = active_trades.get(sym)
-                if not trade:
-                    continue
-                side  = trade.get("side", "")
-                entry = float(trade.get("entry_price", 0) or 0)
-                mark  = marks.get(sym)
-                if mark is None or entry <= 0:
-                    continue
-                if _sl_breached(side, mark, _sl_level(side, entry)):
-                    server_exit_close(sym, mark)
+                try:
+                    _ladder_step(sym, real.get(sym))
+                except Exception as e:
+                    log.error(f"ladder step error for {sym}: {e}", exc_info=True)
         except Exception as e:
             _server_exit_last_error = str(e)
             log.error(f"server_exit_worker error: {e}", exc_info=True)
