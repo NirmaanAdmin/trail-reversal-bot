@@ -3163,6 +3163,21 @@ def _ladder_step(sym, pos, mark):
         if not trade or not pos:
             return  # not tracked, or not confirmed on the exchange yet
         side    = pos["side"]
+        # ── SIDE-CONSISTENCY GUARD (flip→arm race) ────────────
+        # After a flip (close-old + open-new), the CoinDCX positions endpoint can
+        # lag 1–2s and still report the OLD, opposite position. Arming off that
+        # stale snapshot anchors the new leg to the wrong side/avg/qty and yields a
+        # wrong-side stop that false-triggers on the very next poll (observed live:
+        # ETC flip BUY→SELL armed as BUY avg=7.37 qty=89.05 → SL below entry →
+        # stopped the fresh short 6s later). Defer ARMING while the exchange side
+        # disagrees with the side we just tracked; let the snapshot catch up, then
+        # arm off the real fill. Gates ONLY the pre-arm window — once armed, the
+        # committed side/SL govern and the breach check below must always run.
+        if not trade.get("avg_entry") and trade.get("side") and side != trade["side"]:
+            if LADDER_VERBOSE:
+                log.info(f"🪜 ladder[{sym}] arm deferred — exchange side '{side}' "
+                         f"≠ tracked '{trade['side']}' (post-flip snapshot lag)")
+            return
         avg     = float(pos.get("avg_price", 0) or 0)
         mark    = float(mark or 0)                 # LIVE rt-feed price (passed in)
         qty_abs = float(pos.get("qty_abs", 0) or 0)
