@@ -868,6 +868,66 @@ def fetch_real_positions_map():
         return None
 
 
+def real_open_qty(symbol):
+    """Return the symbol's REAL open size on CoinDCX. 0.0 = confirmed flat.
+    None = lookup failed (caller must fail OPEN and use the tracked qty).
+
+    WHY THIS EXISTS — the reduce-only gap:
+    CoinDCX order placement in this file has no reduce-only flag. Every close
+    path (webhook close, flip close, ladder book, ladder flatten, lock close)
+    is a plain OPPOSITE-SIDE MARKET ORDER sized from TRACKED state. If the
+    tracker says we hold more than the exchange actually holds, the excess does
+    not "close nothing" — it OPENS A FRESH POSITION THE OTHER WAY.
+
+    The ladder is already protected: _ladder_step returns early unless the
+    positions snapshot confirms a live `pos`. The reconciler prunes phantoms on
+    a timer. But the webhook close and flip-close branches consulted neither,
+    and both fire on external timing (a Pine gate block, an operator kill)
+    rather than on a poll that just saw the position — which is exactly when
+    the tracker is most likely to be stale.
+
+    Fail-open is deliberate: a failed lookup returns None and the caller falls
+    back to the tracked qty, i.e. the pre-existing behaviour. This helper can
+    only make closes MORE conservative, never less."""
+    try:
+        real = fetch_real_positions_map()
+        if real is None:
+            return None
+        p = real.get(symbol)
+        if not p:
+            return 0.0
+        return float(p.get("qty_abs", 0) or 0)
+    except Exception as e:
+        log.warning(f"real_open_qty({symbol}) failed: {e}")
+        return None
+
+
+def clamp_close_qty(symbol, tracked_qty, label="close"):
+    """Clamp a close size to the exchange's real open size.
+
+    Returns (qty_to_send, is_flat):
+      • (0.0, True)  — exchange confirms FLAT. Send nothing; the caller must
+                       clear the tracker and return. Sending here would open a
+                       new position.
+      • (qty, False) — send this. Equals tracked_qty unless the exchange holds
+                       less, or unless the lookup failed (fail-open)."""
+    rq = real_open_qty(symbol)
+    if rq is None:
+        log.warning(f"⚠️ {label} clamp: {symbol} position lookup failed — "
+                    f"falling back to tracked qty {tracked_qty}")
+        return tracked_qty, False
+    if rq <= 0:
+        log.warning(f"🛑 {label} clamp: {symbol} is ALREADY FLAT on the exchange "
+                    f"(tracked {tracked_qty}) — suppressing order, would have "
+                    f"opened a reverse position")
+        return 0.0, True
+    if rq < tracked_qty:
+        log.warning(f"🛑 {label} clamp: {symbol} tracked {tracked_qty} > real {rq} "
+                    f"— clamping to real size (excess would have opened a reverse)")
+        return rq, False
+    return tracked_qty, False
+
+
 def wait_for_symbol_flat(symbol, timeout=4.0, poll_interval=0.25):
     """Poll fetch_real_positions_map() until `symbol` shows no open position
     on CoinDCX, or until `timeout` seconds have elapsed.
@@ -1840,10 +1900,20 @@ def webhook():
             return jsonify({"status": "rejected", "reason": "missing symbol"}), 200
 
         # ─── DAILY CAP HARD-STOP GATE ─────────────────────────
-        # If today's cumulative locked profit ≥ DAILY_CAP_PCT, reject EVERY
-        # webhook (entry/book/reverse/kill) regardless of type. State persists
-        # until IST midnight rollover OR manual /daily-cap/reset.
-        if daily_cap_active():
+        # If today's cumulative locked profit ≥ DAILY_CAP_PCT, reject new
+        # ENTRY and REVERSE webhooks. State persists until IST midnight
+        # rollover OR manual /daily-cap/reset.
+        #
+        # CLOSE and BOOK pass through — same reasoning as every other gate
+        # below, and the same root cause as the TAO phantom-entry incident
+        # (May 31 2026): a blocked close leaves a live position with no exit
+        # primitive, and lets Pine's state drift out of sync with the book.
+        # The old argument for blocking closes here was "everything is flat by
+        # the time the cap trips" — but that is exactly the argument that
+        # failed for the loss-lock cooldown. Partial fills, in-flight orders
+        # and reconcile races are precisely the cases where it is not true,
+        # and those are the cases where a close matters most.
+        if daily_cap_active() and alert_type in ("entry", "reverse"):
             log.info(f"🛑 DAILY CAP: rejecting {alert_type} for {symbol} "
                      f"(cumulative {_daily_locked_pct_sum:.2f}% / cap {DAILY_CAP_PCT}%)")
             log_trade_event(symbol, action, alert_type, "DAILY_CAP",
@@ -1983,6 +2053,16 @@ def webhook():
                     log.info(f"🔄 FLIP: {symbol} {flip_prev_side.upper()}→{action.upper()} "
                              f"(opposite-direction Pine entry)")
                     cancel_native_sl(symbol)
+                    # REDUCE-ONLY CLAMP: never send more than the exchange holds.
+                    # A stale tracker here would close nothing and open a fresh
+                    # position on the OLD side, immediately before we open the new
+                    # one — double exposure in opposite directions.
+                    if flip_close_qty > 0:
+                        flip_close_qty, flip_flat = clamp_close_qty(
+                            symbol, flip_close_qty, label="flip_close")
+                        if flip_flat:
+                            log.info(f"🔄 FLIP: {symbol} old leg already flat — "
+                                     f"skipping close, proceeding to reopen")
                     if flip_close_qty > 0:
                         log.info(f"🔻 FLIP close: {flip_close_side.upper()} {flip_close_qty} {symbol}")
                         flip_result, flip_close_qty = place_order_step_aware(
@@ -2349,6 +2429,28 @@ def webhook():
                     close_qty = trade["qty"]
                     close_side = "sell" if trade["side"] == "buy" else "buy"
 
+                    # ─── REDUCE-ONLY CLAMP ────────────────────────
+                    # This branch fires on EXTERNAL timing (a Pine gate-block
+                    # close, an operator kill, an sl_wait) rather than off a
+                    # poll that just saw the position — so it is the path most
+                    # likely to be acting on a stale tracker. Without the clamp
+                    # a close against a phantom opens a reverse position.
+                    if close_qty > 0:
+                        close_qty, already_flat = clamp_close_qty(
+                            symbol, close_qty, label=f"close_{reason}")
+                        if already_flat:
+                            # Do NOT record baseline P&L here: whatever closed
+                            # this position (ladder, manual, liquidation) either
+                            # already accounted for it or never did. Recording
+                            # again would double-count. The ladder's own closes
+                            # don't touch the baseline either — stay consistent.
+                            clear_active_trade(symbol, f"{reason} — already flat on exchange")
+                            log_trade_event(symbol, close_side, "close", "SKIP",
+                                            f"reason={reason}, already flat")
+                            return jsonify({"status": "closed", "symbol": symbol,
+                                            "reason": reason,
+                                            "detail": "already flat on exchange"}), 200
+
                     if close_qty > 0:
                         reason_label = {
                             "sl_wait": "SL-WAIT",
@@ -2356,6 +2458,7 @@ def webhook():
                             "sl_hit": "SL",
                             "timer_expired": "TIMER",
                             "kill_switch": "KILL",
+                            "gate_block": "GATE-BLOCK",
                         }.get(reason, reason.upper())
                         log.info(f"🔻 {reason_label} close: "
                                  f"{close_side.upper()} {close_qty} {symbol}")
