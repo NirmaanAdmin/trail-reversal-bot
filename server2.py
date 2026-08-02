@@ -597,6 +597,44 @@ MAX_POSITIONS = int(os.environ.get("MAX_POSITIONS", "0"))
 # SIMULTANEOUSLY switched to the ENTRY-ONLY Pine — otherwise Pine's own SL and
 # this one both fire (harmless duplicate closes, but pointless). SL_PCT is the
 # price distance from entry (e.g. 3.0 → −3% long stop, ≈ −15% ROE at 5x).
+# ═══════════════════════════════════════════════════════════
+#  MAX HOLD TIMER — hard time-based exit per position
+# ═══════════════════════════════════════════════════════════
+# A position is only tradable for MAX_HOLD_SEC seconds. When that elapses the
+# server market-closes whatever remains, at whatever price, booking the
+# profit or loss as it stands. It is a HARD CAP on holding time, nothing else:
+# it does not look at P&L, ladder state, rungs booked, or direction.
+#
+# NO RE-ENTRY LOCKOUT. The symbol is immediately eligible again — the very next
+# Pine entry re-enters normally. This is deliberately UNLIKE the sl_wait path,
+# which arms SL_LOCKOUT_SEC. The close is emitted with reason "timer_expired",
+# never "sl_wait", precisely so no lockout is armed.
+#
+# THE CLOCK IS PER-POSITION, NOT PER-SYMBOL. It starts at entry_time, which
+# set_active_trade() stamps on EVERY open — including the reopen half of a
+# flip. So a flip resets the clock: the new leg is a new position and gets a
+# full MAX_HOLD_SEC of its own. A symbol re-entered after a timer close
+# likewise starts fresh.
+#
+# SURVIVES RESTARTS. entry_time lives in active_trades, which persists to
+# /app/data. A position opened at 00:00 with a 12h timer still closes at 12:00
+# even if the container restarted at 06:00 — on the first poll after boot the
+# age is recomputed from the stored stamp, not from process uptime.
+#
+# INDEPENDENT OF THE LADDER. This worker does not require
+# SERVER_EXITS_ENABLED. If the ladder is off, the timer is still the backstop
+# that guarantees nothing is held indefinitely.
+#
+# Set MAX_HOLD_SEC=0 (default) to disable. Examples:
+#     43200 = 12h      86400 = 24h      3600 = 1h      1800 = 30m
+MAX_HOLD_ENABLED   = os.environ.get("MAX_HOLD_ENABLED", "true").lower() == "true"
+MAX_HOLD_SEC       = float(os.environ.get("MAX_HOLD_SEC", "0"))       # 0 = disabled
+MAX_HOLD_POLL_SEC  = float(os.environ.get("MAX_HOLD_POLL_SEC", "10"))
+
+_max_hold_closes        = 0     # positions closed by the timer since boot
+_max_hold_last_check_at = None
+_max_hold_last_error    = None
+
 SERVER_EXITS_ENABLED = os.environ.get("SERVER_EXITS_ENABLED", "false").lower() == "true"
 SL_PCT               = float(os.environ.get("SL_PCT", "3.0"))        # price % from entry
 EXIT_POLL_SEC        = float(os.environ.get("EXIT_POLL_SEC", "5"))   # 3–10s recommended
@@ -2830,6 +2868,27 @@ def status():
             "in_cooldown": in_loss_lock_cooldown(),
             "cooldown_remaining_sec": loss_cooldown_remaining_sec(),
         },
+        "max_hold": {
+            "enabled": MAX_HOLD_ENABLED,
+            "cap_sec": MAX_HOLD_SEC,
+            "cap_hours": round(MAX_HOLD_SEC / 3600, 2) if MAX_HOLD_SEC > 0 else 0,
+            "poll_sec": MAX_HOLD_POLL_SEC,
+            "closes_total": _max_hold_closes,
+            "last_check_at": _max_hold_last_check_at,
+            "last_error": _max_hold_last_error,
+            "open_ages": {
+                s_: {
+                    "held_sec": round(time.time() - float(t_.get("entry_time", 0) or 0), 1),
+                    "held_hours": round((time.time() - float(t_.get("entry_time", 0) or 0)) / 3600, 2),
+                    "closes_in_sec": (
+                        round(MAX_HOLD_SEC - (time.time() - float(t_.get("entry_time", 0) or 0)), 1)
+                        if MAX_HOLD_SEC > 0 else None
+                    ),
+                }
+                for s_, t_ in list(active_trades.items())
+                if float(t_.get("entry_time", 0) or 0) > 0
+            },
+        },
         "daily_pnl": {
             "enabled": DAILY_PNL_ENABLED,
             "basis": DAILY_PNL_BASIS,
@@ -3780,6 +3839,124 @@ def _ladder_step(sym, pos, mark):
             _save_active_trades()
 
 
+# ═══════════════════════════════════════════════════════════
+#  MAX HOLD TIMER WORKER
+# ═══════════════════════════════════════════════════════════
+def _max_hold_close(sym, trade, age):
+    """Market-close whatever remains of `sym` because its hold time expired.
+    Runs under _trade_lock (caller holds it). Returns True if the tracker was
+    cleared, False if the close failed and the tracker must be kept for retry.
+
+    REDUCE-ONLY CLAMP applies here exactly as on every other close path. This
+    fires on a CLOCK, not off a poll that just saw the position, so it is a
+    prime candidate for acting on a stale tracker — and on CoinDCX an
+    over-sized close does not close nothing, it OPENS A REVERSE POSITION."""
+    global _max_hold_closes
+    close_qty = float(trade.get("qty", 0) or 0)
+    if close_qty <= 0:
+        clear_active_trade(sym, "max-hold — nothing to close")
+        return True
+
+    close_qty, already_flat = clamp_close_qty(sym, close_qty, label="max_hold")
+    if already_flat:
+        log.info(f"⏱ MAX-HOLD: {sym} already flat on the exchange after "
+                 f"{age/3600:.2f}h — clearing tracker only")
+        clear_active_trade(sym, "max-hold — already flat on exchange")
+        return True
+
+    close_side = "sell" if trade.get("side") == "buy" else "buy"
+    lev = trade.get("leverage", DEFAULT_LEVERAGE)
+    mcy = trade.get("margin_ccy", DEFAULT_MARGIN)
+    log.warning(f"⏱ MAX-HOLD EXPIRED: {sym} held {age/3600:.2f}h "
+                f"(cap {MAX_HOLD_SEC/3600:.2f}h) — closing {close_qty} "
+                f"{close_side.upper()} at market")
+
+    ok, used = _ladder_close(sym, close_side, close_qty, None, lev, mcy, "max_hold")
+    if not ok:
+        # Keep the tracker so the next poll retries. Never orphan a position by
+        # clearing state after a failed close — same rule the ladder follows.
+        log.error(f"❌ MAX-HOLD close FAILED for {sym} — keeping tracker, will retry "
+                  f"in {MAX_HOLD_POLL_SEC}s")
+        return False
+
+    cancel_native_sl(sym)
+    # Record realized P&L against the baseline, same as any other exit path.
+    try:
+        mark = fetch_mark_price(sym)
+        if mark:
+            baseline_record_realized_pnl(
+                symbol=sym, entry_price=trade.get("avg_entry") or trade.get("entry_price"),
+                exit_price=mark, qty=used or close_qty,
+                side=trade.get("side"), leverage=lev)
+    except Exception as e:
+        log.warning(f"max-hold: baseline record failed for {sym}: {e}")
+
+    _max_hold_closes += 1
+    clear_active_trade(sym, f"max-hold {age/3600:.2f}h")
+    log_trade_event(sym, close_side, "timer_expired", "FILLED",
+                    f"held {age/3600:.2f}h ≥ cap {MAX_HOLD_SEC/3600:.2f}h")
+    return True
+
+
+def max_hold_worker():
+    """Background thread: every MAX_HOLD_POLL_SEC, closes any tracked position
+    whose age since entry_time exceeds MAX_HOLD_SEC.
+
+    Deliberately INDEPENDENT of SERVER_EXITS_ENABLED — if the ladder is off,
+    this is still the guarantee that nothing is held forever.
+
+    The clock is read from the PERSISTED entry_time, so a container restart
+    does not reset it: a position opened at 00:00 with a 12h cap still closes
+    at 12:00 even if the process only started at 06:00."""
+    global _max_hold_last_check_at, _max_hold_last_error
+    log.info(f"⏱ Max-hold timer started — enabled={MAX_HOLD_ENABLED}, "
+             f"cap={MAX_HOLD_SEC}s ({MAX_HOLD_SEC/3600:.2f}h), "
+             f"poll={MAX_HOLD_POLL_SEC}s"
+             + ("" if MAX_HOLD_SEC > 0 else "  [DISABLED — MAX_HOLD_SEC=0]"))
+    while True:
+        try:
+            time.sleep(MAX_HOLD_POLL_SEC)
+            if not MAX_HOLD_ENABLED or MAX_HOLD_SEC <= 0:
+                continue
+            if not active_trades:
+                continue
+            now = time.time()
+            _max_hold_last_check_at = datetime.now(timezone.utc).isoformat()
+            expired = []
+            for sym, trade in list(active_trades.items()):
+                try:
+                    et = float(trade.get("entry_time", 0) or 0)
+                except (TypeError, ValueError):
+                    et = 0.0
+                if et <= 0:
+                    # No usable stamp (hand-injected tracker). Stamp it now so the
+                    # cap starts from this moment rather than closing instantly.
+                    trade["entry_time"] = now
+                    _save_active_trades()
+                    log.warning(f"⏱ MAX-HOLD: {sym} had no entry_time — stamping now, "
+                                f"cap starts from this moment")
+                    continue
+                age = now - et
+                if age >= MAX_HOLD_SEC:
+                    expired.append((sym, age))
+            if not expired:
+                _max_hold_last_error = None
+                continue
+            with _trade_lock:
+                for sym, age in expired:
+                    trade = active_trades.get(sym)
+                    if not trade:
+                        continue  # closed by the ladder / a webhook in the meantime
+                    try:
+                        _max_hold_close(sym, trade, age)
+                    except Exception as e:
+                        log.error(f"max-hold close error for {sym}: {e}", exc_info=True)
+            _max_hold_last_error = None
+        except Exception as e:
+            _max_hold_last_error = str(e)
+            log.error(f"max_hold_worker error: {e}", exc_info=True)
+
+
 def server_exit_worker():
     """Server-owned exit ladder (SL + partial books + ratcheting trail). Every
     EXIT_POLL_SEC it pulls one positions snapshot from CoinDCX and evaluates the
@@ -3819,6 +3996,14 @@ def server_exit_worker():
 # PROFIT_LOCK_ENABLED env var so you can flip it without a redeploy).
 _profit_lock_thread = threading.Thread(target=profit_lock_worker, daemon=True)
 _profit_lock_thread.start()
+
+# Start the max-hold timer thread (unconditional — self-gates on
+# MAX_HOLD_ENABLED and MAX_HOLD_SEC > 0). Independent of SERVER_EXITS_ENABLED:
+# even with the ladder off, this guarantees nothing is held past the cap.
+_max_hold_thread = threading.Thread(target=max_hold_worker, daemon=True)
+_max_hold_thread.start()
+log.info(f"⏱ Max-hold initialized — enabled={MAX_HOLD_ENABLED}, "
+         f"cap={MAX_HOLD_SEC}s ({MAX_HOLD_SEC/3600:.2f}h), poll={MAX_HOLD_POLL_SEC}s")
 
 # Start the loss-lock monitor thread (unconditional — self-gates on
 # LOSS_LOCK_ENABLED env var, which defaults to false. Set it to "true" on
