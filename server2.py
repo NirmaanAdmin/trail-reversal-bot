@@ -2199,6 +2199,23 @@ def webhook():
         if not symbol:
             return jsonify({"status": "rejected", "reason": "missing symbol"}), 200
 
+        # ─── LABELED GATE — reject unlabeled (resync/ghost) ENTRIES ─────────────
+        # Entry-only Pine stamps every entry webhook with "labeled": "1" when the
+        # chart entry LABEL drew on that bar, and "0" when it did not (the resync
+        # catch-up path fires an entry webhook WITHOUT drawing a label — that is the
+        # unlabeled ghost that wiped PENGU / XPL). Reject any ENTRY explicitly marked
+        # labeled == "0". ALLOW-IF-ABSENT: an entry with no `labeled` field at all
+        # still passes, so alerts not yet recreated on the labeled-flag Pine keep
+        # working during the recreation sweep. Scoped to type==entry ONLY; book,
+        # close and reverse are never gated (they must always process). Once every
+        # alert is recreated on the new Pine, only labeled entries exist anyway.
+        if alert_type == "entry" and str(data.get("labeled", "1")) == "0":
+            log.info(f"🏷️ UNLABELED entry rejected: {symbol} {action} "
+                     f"(resync/ghost — no chart label)")
+            log_trade_event(symbol, action, "entry", "UNLABELED", "no chart label")
+            return jsonify({"status": "rejected",
+                            "reason": "unlabeled entry (no chart label)"}), 200
+
         # ─── DAILY CAP HARD-STOP GATE ─────────────────────────
         # If today's cumulative locked profit ≥ DAILY_CAP_PCT, reject new
         # ENTRY and REVERSE webhooks. State persists until IST midnight
