@@ -2604,6 +2604,12 @@ def webhook():
 
             # ─── REVERSE — SL hit, close remaining + open opposite ──
             elif alert_type == "reverse":
+                # Captured once, up front, before anything below can mutate
+                # active_trades (clear_active_trade() removes this symbol's
+                # entry partway through this branch). Everything new added by
+                # this patch reads was_tracked instead of re-deriving it.
+                was_tracked = symbol in active_trades
+
                 # ─── POSITION CAP on REVERSE ──────────────────────────
                 # A reverse for a symbol we are NOT tracking is a net-new
                 # position: there's nothing to close, so the opposite leg below
@@ -2663,6 +2669,31 @@ def webhook():
 
                     clear_active_trade(symbol, "reverse — SL hit")
                     log_trade_event(symbol, close_side, "reverse_close", "FILLED", "Pine reverse")
+
+                # ─── UNTRACKED GUARD — reverse is now a strict flip-only op ──
+                # A reverse with nothing to flip (was_tracked=False) used to
+                # fall through to the open logic below unconditionally once it
+                # cleared the POSITION CAP check above — meaning any reverse
+                # that had ROOM under the cap opened a fresh position anyway,
+                # with none of "reverse"'s implied semantics (a real prior
+                # entry, a real prior price). This bot's own design already
+                # fires a plain `entry` webhook ~1 bar after every reverse
+                # (Pine's "REVERSE ENTRY" block, original behavior, not new),
+                # and that path already re-checks POSITION CAP and the
+                # already-tracked skip on its own. So an untracked reverse no
+                # longer needs to be the one that opens — it's a no-op, and
+                # the follow-up entry webhook is the sole path back in for a
+                # cap-rejected/untracked symbol. The POSITION CAP (reverse)
+                # guard above is left in place as defense-in-depth.
+                if not was_tracked:
+                    log.info(f"↩️ REVERSE on untracked {symbol} — nothing to flip, "
+                             f"no-op. Pine's follow-up entry webhook will open it "
+                             f"if the position cap allows.")
+                    log_trade_event(symbol, action, "reverse", "SKIP",
+                                    "untracked — no position to flip")
+                    return jsonify({"status": "skipped",
+                                    "reason": f"reverse on untracked {symbol} — "
+                                              f"no position to flip"}), 200
 
                 # ─── POLL-CONFIRM-FLAT BEFORE REOPEN ──────────────────
                 # Previous behavior: blind `time.sleep(1)` here, then reopen.
