@@ -1369,6 +1369,167 @@ def daily_pnl_worker():
             log.error(f"daily_pnl_worker error: {e}", exc_info=True)
 
 
+
+# ═══════════════════════════════════════════════════════════
+#  DAILY AUTO-FLATTEN — close everything once a day at a fixed IST time
+#
+#  At DAILY_FLATTEN_TIME (HH:MM or HH:MM:SS, IST) every position is closed via
+#  close_all_positions(lock_type="flatten"): tracked AND orphan positions, with
+#  the same post-close sweep as the locks. After the flatten, ENTRY and REVERSE
+#  webhooks are rejected for DAILY_FLATTEN_COOLDOWN_SEC so in-flight Pine alerts
+#  can't reopen positions mid-close (same race as the 2026-05-29 lock incident).
+#  CLOSE and BOOK always pass. Trading resumes normally after the cooldown.
+#
+#  Flatten does NOT touch the streak counter, the daily cap, the profit-lock or
+#  loss-lock cooldowns — it is a scheduled housekeeping close, not a lock.
+#
+#  Fires at most once per IST date (persisted to DAILY_FLATTEN_FILE, so a
+#  restart inside the window does not double-fire). If the process was down at
+#  the scheduled time it still fires on boot, provided it is no more than
+#  DAILY_FLATTEN_GRACE_SEC late; beyond that the day is marked "missed" and
+#  nothing is closed (a surprise flatten hours late is worse than none).
+#  Env vars are read at process start — Railway Redeploy after changing them.
+# ═══════════════════════════════════════════════════════════
+DAILY_FLATTEN_ENABLED      = os.environ.get("DAILY_FLATTEN_ENABLED", "true").lower() == "true"
+DAILY_FLATTEN_TIME         = os.environ.get("DAILY_FLATTEN_TIME", "10:29").strip()
+DAILY_FLATTEN_COOLDOWN_SEC = int(os.environ.get("DAILY_FLATTEN_COOLDOWN_SEC", "60"))
+DAILY_FLATTEN_GRACE_SEC    = int(os.environ.get("DAILY_FLATTEN_GRACE_SEC", "300"))
+DAILY_FLATTEN_POLL_SEC     = float(os.environ.get("DAILY_FLATTEN_POLL_SEC", "5"))
+DAILY_FLATTEN_FILE         = os.environ.get("DAILY_FLATTEN_FILE", "/app/data/daily_flatten_state.json")
+
+_flatten_until        = 0.0    # epoch; entry/reverse gated while now < this
+_flatten_last_date    = None   # IST date string of the last fire/miss
+_flatten_last_result  = None   # "fired" | "missed"
+_flatten_last_at      = None   # UTC iso timestamp of last fire
+_flatten_last_closed  = None   # symbols seen open at fire time
+_flatten_last_error   = None
+_flatten_count        = 0
+
+
+def _parse_flatten_time(s):
+    """'HH:MM' or 'HH:MM:SS' → (h, m, sec). Returns None if malformed."""
+    try:
+        parts = [int(p) for p in s.split(":")]
+    except (ValueError, AttributeError):
+        return None
+    if len(parts) == 2:
+        parts.append(0)
+    if len(parts) != 3:
+        return None
+    h, m, sec = parts
+    if not (0 <= h <= 23 and 0 <= m <= 59 and 0 <= sec <= 59):
+        return None
+    return h, m, sec
+
+
+_FLATTEN_HMS = _parse_flatten_time(DAILY_FLATTEN_TIME)
+if DAILY_FLATTEN_ENABLED and _FLATTEN_HMS is None:
+    logging.getLogger("bot").error(
+        f"❌ DAILY_FLATTEN_TIME='{DAILY_FLATTEN_TIME}' is not HH:MM[:SS] — daily flatten DISABLED")
+    DAILY_FLATTEN_ENABLED = False
+
+
+def _flatten_target_today(now_ist):
+    h, m, sec = _FLATTEN_HMS
+    return now_ist.replace(hour=h, minute=m, second=sec, microsecond=0)
+
+
+def _flatten_next_fire_ist():
+    if not DAILY_FLATTEN_ENABLED or _FLATTEN_HMS is None:
+        return None
+    now = datetime.now(IST_TZ)
+    t = _flatten_target_today(now)
+    if t <= now or _flatten_last_date == str(now.date()):
+        t = t + timedelta(days=1)
+    return t.isoformat()
+
+
+def in_flatten_cooldown():
+    return time.time() < _flatten_until
+
+
+def flatten_cooldown_remaining_sec():
+    return max(0, int(_flatten_until - time.time()))
+
+
+def save_daily_flatten_state():
+    try:
+        os.makedirs(os.path.dirname(DAILY_FLATTEN_FILE), exist_ok=True)
+        with open(DAILY_FLATTEN_FILE, "w") as f:
+            json.dump({
+                "last_date": _flatten_last_date,
+                "last_result": _flatten_last_result,
+                "last_at": _flatten_last_at,
+                "last_closed": _flatten_last_closed,
+            }, f, indent=2)
+    except Exception as e:
+        log.error(f"❌ Failed to save daily flatten state: {e}")
+
+
+def load_daily_flatten_state():
+    global _flatten_last_date, _flatten_last_result, _flatten_last_at, _flatten_last_closed
+    try:
+        with open(DAILY_FLATTEN_FILE) as f:
+            s = json.load(f)
+    except FileNotFoundError:
+        return
+    except (json.JSONDecodeError, ValueError) as e:
+        log.warning(f"⚠️ Daily flatten file corrupt ({e}) — starting fresh")
+        return
+    _flatten_last_date   = s.get("last_date")
+    _flatten_last_result = s.get("last_result")
+    _flatten_last_at     = s.get("last_at")
+    _flatten_last_closed = s.get("last_closed")
+
+
+def run_daily_flatten(reason):
+    """Flatten everything now. Used by the scheduler and /daily-flatten/force."""
+    global _flatten_last_at, _flatten_last_closed, _flatten_count
+    real = fetch_real_positions_map() or {}
+    syms = sorted(set(active_trades.keys()) | set(real.keys()))
+    log.warning(f"⏰ DAILY FLATTEN ({reason}) — {len(syms)} open: {syms}")
+    close_all_positions(trigger_reason=reason, trigger_pct=None, lock_type="flatten")
+    _flatten_last_at     = datetime.now(timezone.utc).isoformat()
+    _flatten_last_closed = syms
+    _flatten_count      += 1
+    return syms
+
+
+def daily_flatten_worker():
+    global _flatten_last_date, _flatten_last_result, _flatten_last_error
+    log.info(f"⏰ Daily flatten scheduler started — enabled={DAILY_FLATTEN_ENABLED}, "
+             f"time={DAILY_FLATTEN_TIME} IST, cooldown={DAILY_FLATTEN_COOLDOWN_SEC}s, "
+             f"grace={DAILY_FLATTEN_GRACE_SEC}s, next={_flatten_next_fire_ist()}")
+    while True:
+        try:
+            time.sleep(DAILY_FLATTEN_POLL_SEC)
+            if not DAILY_FLATTEN_ENABLED:
+                continue
+            now = datetime.now(IST_TZ)
+            today = str(now.date())
+            if _flatten_last_date == today:
+                continue
+            late = (now - _flatten_target_today(now)).total_seconds()
+            if late < 0:
+                continue
+            if late > DAILY_FLATTEN_GRACE_SEC:
+                _flatten_last_date, _flatten_last_result = today, "missed"
+                save_daily_flatten_state()
+                log.warning(f"⏰ DAILY FLATTEN missed for {today} — process was not running at "
+                            f"{DAILY_FLATTEN_TIME} IST ({late:.0f}s late > grace "
+                            f"{DAILY_FLATTEN_GRACE_SEC}s). Nothing closed; use /daily-flatten/force if needed")
+                continue
+            run_daily_flatten(f"daily flatten {DAILY_FLATTEN_TIME} IST"
+                              + (f" ({late:.0f}s late)" if late > DAILY_FLATTEN_POLL_SEC * 2 else ""))
+            # Mark done only after close_all_positions returns, so an exception
+            # mid-close retries on the next poll (close-all is idempotent).
+            _flatten_last_date, _flatten_last_result = today, "fired"
+            save_daily_flatten_state()
+            _flatten_last_error = None
+        except Exception as e:
+            _flatten_last_error = str(e)
+            log.error(f"daily_flatten_worker error: {e}", exc_info=True)
+
 # ─── Event Log ───
 trade_log = []
 MAX_LOG = 50
@@ -1649,9 +1810,12 @@ def close_all_positions(trigger_reason="profit lock", trigger_pct=None, lock_typ
     positions on symbols the bot isn't even tracking.
     """
     global _profit_lock_until, _loss_lock_until
+    global _flatten_until
     snapshot = list(active_trades.items())
     header_emoji = "🛑" if lock_type == "loss" else "🔒"
     header_label = "LOSS LOCK" if lock_type == "loss" else "PROFIT LOCK"
+    if lock_type == "flatten":
+        header_emoji, header_label = "⏰", "DAILY FLATTEN"
     log.info(f"{header_emoji} {header_label} triggered ({trigger_reason}) — closing {len(snapshot)} positions")
 
     # ─── ARM COOLDOWN IMMEDIATELY ────────────────────────────
@@ -1684,7 +1848,9 @@ def close_all_positions(trigger_reason="profit lock", trigger_pct=None, lock_typ
     # of completion time, so users see ~3s less cooldown at the back end —
     # negligible vs the bug. Behavior is identical for /profit-lock/force
     # since it routes through this same function.
-    if lock_type == "loss":
+    if lock_type == "flatten":
+        _flatten_until = time.time() + DAILY_FLATTEN_COOLDOWN_SEC
+    elif lock_type == "loss":
         _loss_lock_until = time.time() + LOSS_LOCK_COOLDOWN_SEC
     else:
         _profit_lock_until = time.time() + COOLDOWN_AFTER_LOCK_SEC
@@ -1744,6 +1910,7 @@ def close_all_positions(trigger_reason="profit lock", trigger_pct=None, lock_typ
                 if isinstance(result, dict) and result.get("status") == "error":
                     log.warning(f"⚠️ Lock close failed for {sym}: {result.get('message','')}")
                 log_trade_event(sym, close_side,
+                                "daily_flatten" if lock_type == "flatten" else
                                 "loss_lock" if lock_type == "loss" else "profit_lock",
                                 "FILLED", trigger_reason)
             except Exception as e:
@@ -1805,7 +1972,12 @@ def close_all_positions(trigger_reason="profit lock", trigger_pct=None, lock_typ
     # Cooldown clock was armed at the TOP of this function (see the big
     # comment block there). Here we just emit the completion log and
     # register with the streak / daily-cap trackers.
-    if lock_type == "loss":
+    if lock_type == "flatten":
+        # Scheduled housekeeping — no streak / daily-cap / lock bookkeeping.
+        cooldown_end = datetime.fromtimestamp(_flatten_until, IST_TZ).strftime("%H:%M:%S")
+        log.info(f"✅ DAILY FLATTEN complete — all positions closed, "
+                 f"entries blocked until {cooldown_end} IST")
+    elif lock_type == "loss":
         cooldown_end = datetime.fromtimestamp(_loss_lock_until).strftime("%H:%M:%S")
         log.info(f"✅ LOSS LOCK complete — all positions closed, cooldown until {cooldown_end}")
         # Loss lock breaks any active profit-lock streak
@@ -2253,6 +2425,15 @@ def webhook():
                 "reason": f"daily P&L target reached ({_dpnl_hit_reason}); "
                           f"resumes at IST midnight or /daily-pnl/reset"
             }), 200
+
+        # ─── DAILY FLATTEN COOLDOWN GATE ──────────────────────
+        # Short block after the scheduled daily flatten so in-flight Pine
+        # entries can't reopen mid-close. CLOSE and BOOK always pass.
+        if in_flatten_cooldown() and alert_type in ("entry", "reverse"):
+            remaining = flatten_cooldown_remaining_sec()
+            log.info(f"⏰ FLATTEN COOLDOWN: rejecting {alert_type} for {symbol} — {remaining}s left")
+            log_trade_event(symbol, action, alert_type, "FLATTEN_COOLDOWN", f"{remaining}s remaining")
+            return jsonify({"status": "rejected", "reason": f"daily-flatten cooldown ({remaining}s)"}), 200
 
         # ─── PROFIT-LOCK COOLDOWN GATE ────────────────────────
         # After an auto-close-all, reject ENTRY and REVERSE webhooks for
@@ -2978,6 +3159,21 @@ def status():
             "pause_remaining_sec": streak_pause_remaining_sec(),
             "last_lock_at": _streak_last_lock_at,
         },
+        "daily_flatten": {
+            "enabled": DAILY_FLATTEN_ENABLED,
+            "time_ist": DAILY_FLATTEN_TIME,
+            "next_fire_ist": _flatten_next_fire_ist(),
+            "cooldown_sec": DAILY_FLATTEN_COOLDOWN_SEC,
+            "grace_sec": DAILY_FLATTEN_GRACE_SEC,
+            "in_cooldown": in_flatten_cooldown(),
+            "cooldown_remaining_sec": flatten_cooldown_remaining_sec(),
+            "last_date": _flatten_last_date,
+            "last_result": _flatten_last_result,
+            "last_at": _flatten_last_at,
+            "last_closed": _flatten_last_closed,
+            "fires_since_boot": _flatten_count,
+            "last_error": _flatten_last_error,
+        },
         "time": datetime.now().isoformat()
     })
 
@@ -3613,6 +3809,35 @@ def baseline_reset():
     return jsonify({"status": "reset"}), 200
 
 
+@app.route("/daily-flatten/status", methods=["GET"])
+def daily_flatten_status():
+    if not _secret_ok(_request_secret()):
+        return jsonify({"error": "unauthorized"}), 401
+    return jsonify({
+        "enabled": DAILY_FLATTEN_ENABLED,
+        "time_ist": DAILY_FLATTEN_TIME,
+        "ist_now": datetime.now(IST_TZ).isoformat(),
+        "next_fire_ist": _flatten_next_fire_ist(),
+        "in_cooldown": in_flatten_cooldown(),
+        "cooldown_remaining_sec": flatten_cooldown_remaining_sec(),
+        "last_date": _flatten_last_date,
+        "last_result": _flatten_last_result,
+        "last_at": _flatten_last_at,
+        "last_closed": _flatten_last_closed,
+        "last_error": _flatten_last_error,
+    }), 200
+
+
+@app.route("/daily-flatten/force", methods=["POST", "GET"])
+def daily_flatten_force():
+    """Run the daily flatten right now (does not affect today's scheduled fire)."""
+    if not _secret_ok(_request_secret()):
+        return jsonify({"error": "unauthorized"}), 401
+    syms = run_daily_flatten("manual /daily-flatten/force")
+    return jsonify({"status": "flattened", "symbols": syms,
+                    "cooldown_remaining_sec": flatten_cooldown_remaining_sec()}), 200
+
+
 @app.route("/health", methods=["GET"])
 def health():
     # Public, unauthenticated uptime probe. Deliberately leaks NO position
@@ -4096,6 +4321,13 @@ log.info(f"🛡️ Server-exit initialized — enabled={SERVER_EXITS_ENABLED}, "
 # entry handler). Log it so the build is confirmable from the boot line.
 log.info(f"🔄 Pine-flip on opposite entry: {'ON' if SERVER_EXITS_ENABLED else 'OFF'} "
          f"(close-current-open-new; gated on SERVER_EXITS_ENABLED)")
+
+# Daily auto-flatten scheduler (self-gates on DAILY_FLATTEN_ENABLED).
+load_daily_flatten_state()
+_daily_flatten_thread = threading.Thread(target=daily_flatten_worker, daemon=True)
+_daily_flatten_thread.start()
+log.info(f"⏰ Daily flatten initialized — enabled={DAILY_FLATTEN_ENABLED}, "
+         f"time={DAILY_FLATTEN_TIME} IST, last={_flatten_last_date} ({_flatten_last_result})")
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
