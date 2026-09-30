@@ -253,7 +253,9 @@ def round_down_quantity(qty, price, symbol=None):
         step = get_qty_step(symbol)
         if step and step > 0:
             decimals = max(0, -math.floor(math.log10(step)))
-            return round(math.floor(qty / step) * step, decimals)
+            # +1e-9: 101.6/0.1 evaluates to 1015.9999999999999 in floating
+            # point, and a bare floor() would drop a whole step (→ 101.5).
+            return round(math.floor(qty / step + 1e-9) * step, decimals)
     # Fallback heuristic — used only when symbol-specific step is unavailable
     if price >= 1000:
         return math.floor(qty * 1000) / 1000
@@ -1882,7 +1884,22 @@ def close_all_positions(trigger_reason="profit lock", trigger_pct=None, lock_typ
                     lev = real_positions[sym]["leverage"] if not trade else trade.get("leverage", real_positions[sym]["leverage"])
                     mcy = real_positions[sym]["margin_ccy"] if not trade else trade.get("margin_ccy", real_positions[sym]["margin_ccy"])
                     if tracked_qty > 0 and abs(close_qty - tracked_qty) > 1e-9:
-                        log.info(f"📐 {sym} qty mismatch — tracked={tracked_qty}, real={close_qty} (using real)")
+                        # STALE-READ GUARD (BERA 2026-09-30 07:04): a ladder book
+                        # filled 0.4s earlier, the positions endpoint still showed
+                        # the pre-book 308.1, the lock sold 308.1 against a real
+                        # 206.5 and FLIPPED the account short 101.6. CoinDCX
+                        # closes are not reduce-only, so over-closing opens the
+                        # opposite side. Same side + real > tracked ⇒ trust the
+                        # tracker (updated synchronously by the ladder/webhook);
+                        # the post-close sweep catches any true residue.
+                        if (real_positions[sym]["side"] == trade.get("side")
+                                and close_qty > tracked_qty):
+                            snapped = round_down_quantity(tracked_qty, fetch_mark_price(sym) or 1, symbol=sym)
+                            log.info(f"📐 {sym} qty mismatch — tracked={tracked_qty}, real={close_qty} "
+                                     f"(real looks STALE — closing tracked {snapped}; sweep catches residue)")
+                            close_qty = snapped
+                        else:
+                            log.info(f"📐 {sym} qty mismatch — tracked={tracked_qty}, real={close_qty} (using real)")
                     if not trade:
                         log.info(f"🧹 {sym} found on CoinDCX but NOT in active_trades — orphan being cleaned up")
                 elif tracked_qty > 0:
@@ -1927,6 +1944,21 @@ def close_all_positions(trigger_reason="profit lock", trigger_pct=None, lock_typ
             time.sleep(1.5)  # let CoinDCX settle the close orders
             residual = fetch_real_positions_map()
             if residual:
+                # CONFIRM-READ: the positions endpoint lags fills by 1–2s. A stale
+                # read here would show a position our close already flattened, and
+                # sweeping it would OPEN the opposite side. Re-read and sweep only
+                # what both reads agree on (same side, same size).
+                time.sleep(1.0)
+                confirm = fetch_real_positions_map()
+                if confirm is not None:
+                    dropped = [s for s, p in residual.items()
+                               if s not in confirm or confirm[s]["side"] != p["side"]
+                               or abs(confirm[s]["qty_abs"] - p["qty_abs"]) > 1e-9]
+                    if dropped:
+                        log.info(f"🧹 Post-lock sweep: {dropped} changed between reads "
+                                 f"(stale first read) — not sweeping them")
+                    residual = {s: p for s, p in residual.items() if s not in dropped}
+            if residual:
                 log.warning(f"⚠️ Post-lock sweep: {len(residual)} position(s) still open: {list(residual.keys())}")
                 for sym, pos in residual.items():
                     try:
@@ -1940,7 +1972,7 @@ def close_all_positions(trigger_reason="profit lock", trigger_pct=None, lock_typ
                         step = get_qty_step(sym)
                         if step and step > 0:
                             decimals = max(0, -math.floor(math.log10(step)))
-                            sweep_qty = round(math.floor(sweep_qty / step) * step, decimals)
+                            sweep_qty = round(math.floor(sweep_qty / step + 1e-9) * step, decimals)
                         if sweep_qty <= 0:
                             log.warning(f"⚠️ Sweep skipped for {sym} — qty floors to 0 (step={step}, real={pos['qty_abs']})")
                             continue
