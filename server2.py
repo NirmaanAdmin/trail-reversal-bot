@@ -2823,6 +2823,24 @@ def webhook():
                 # this patch reads was_tracked instead of re-deriving it.
                 was_tracked = symbol in active_trades
 
+                # ─── SAME-SIDE GUARD — the flip already happened ──────────
+                # A reverse means "SL hit, now hold <action>". If we already hold
+                # <action> on this symbol, there is nothing to flip. Observed
+                # INJ 2026-10-01 10:05:59: Pine's follow-up `entry` (SELL)
+                # ARRIVED BEFORE its `reverse` (SELL) — webhook delivery is not
+                # ordered. The entry opened the short; the reverse then closed
+                # and reopened the SAME short 1s later: 2 wasted fills of fees,
+                # and CoinDCX left the first leg's isolated margin attached, so
+                # a 1×-size position carried 2× margin. No-op instead.
+                if was_tracked and active_trades[symbol].get("side") == action:
+                    held = active_trades[symbol]
+                    mins = int((time.time() - float(held.get("entry_time", time.time()) or time.time())) // 60)
+                    log.info(f"↩️ REVERSE to the side already held: {symbol} {action.upper()} "
+                             f"(held {mins}m) — no-op, nothing to flip (entry likely arrived first)")
+                    log_trade_event(symbol, action, "reverse", "SKIP", "already on target side")
+                    return jsonify({"status": "skipped",
+                                    "reason": f"reverse to {action} on {symbol} — already held"}), 200
+
                 # ─── POSITION CAP on REVERSE ──────────────────────────
                 # A reverse for a symbol we are NOT tracking is a net-new
                 # position: there's nothing to close, so the opposite leg below
