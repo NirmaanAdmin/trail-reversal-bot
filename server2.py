@@ -312,6 +312,19 @@ FLAT_ONLY_SETUP_CHECK = os.environ.get("FLAT_ONLY_SETUP_CHECK", "true").lower() 
 _symbol_last_exit = {}          # {symbol: unix seconds when it last left active_trades}
 _flat_only_skips = {"held": 0, "stale_setup": 0}
 
+# ─── FRESH-LEG FLIP GUARD (2026-10-16 SKR incident) ───
+# An opposite entry that lands within FLIP_FRESH_GRACE_SEC of the leg it would
+# flip is SKIPPED. The CoinDCX positions endpoint lags a just-filled order by
+# 1–2s, so the flip's reduce-only clamp read the fresh SELL as "already flat",
+# sent no close, cleared the tracker, then saw the SELL appear and aborted the
+# reopen — leaving an UNTRACKED short on the exchange with no ladder, no books
+# and no stop. A flip that fast is whipsaw anyway. 0 = off.
+try:
+    FLIP_FRESH_GRACE_SEC = float(os.environ.get("FLIP_FRESH_GRACE_SEC", "15"))
+except ValueError:
+    FLIP_FRESH_GRACE_SEC = 15.0
+_flip_guard_stats = {"fresh_skips": 0, "readopted": 0}
+
 
 class _TrackedTrades(dict):
     """A plain dict that also stamps _symbol_last_exit whenever a symbol is removed."""
@@ -2689,6 +2702,21 @@ def webhook():
                     # gate (the close just freed equivalent margin, and the avail
                     # cache would read stale pre-close — exactly why the reverse
                     # reopen has no margin gate either).
+                    # ─── FRESH-LEG GUARD — see FLIP_FRESH_GRACE_SEC ───
+                    try:
+                        leg_age = time.time() - float(trade.get("entry_time") or 0)
+                    except (TypeError, ValueError):
+                        leg_age = 1e9
+                    if FLIP_FRESH_GRACE_SEC > 0 and 0 <= leg_age < FLIP_FRESH_GRACE_SEC:
+                        _flip_guard_stats["fresh_skips"] += 1
+                        log.info(f"⏱️ SKIP flip: {symbol} {trade['side'].upper()} leg is only "
+                                 f"{leg_age:.1f}s old (< {FLIP_FRESH_GRACE_SEC:.0f}s) — exchange "
+                                 f"snapshot not reliable yet; keeping the current leg")
+                        log_trade_event(symbol, action, "entry", "SKIP",
+                                        f"flip on fresh leg ({leg_age:.1f}s)")
+                        return jsonify({"status": "skipped",
+                                        "reason": f"flip on fresh leg ({leg_age:.1f}s old)"}), 200
+
                     flip_prev_side  = trade["side"]
                     flip_entry_px   = trade["entry_price"]
                     flip_close_side = "sell" if flip_prev_side == "buy" else "buy"
@@ -2738,6 +2766,29 @@ def webhook():
                                   f"margin. Staying flat; next Pine entry re-enters cleanly.")
                         log_trade_event(symbol, action, "flip_entry", "ABORT",
                                         "close did not settle within 4s")
+                        # SAFETY NET: no close was sent (the clamp read "flat") yet the
+                        # exchange holds a position → it is real and now untracked.
+                        # Re-track it from the exchange so the ladder arms and manages
+                        # it, instead of leaving an orphan with no exits.
+                        if flip_close_qty <= 0:
+                            try:
+                                real_ = fetch_real_positions_map() or {}
+                                rp_ = real_.get(symbol)
+                                if rp_ and float(rp_.get("qty_abs", 0) or 0) > 0:
+                                    set_active_trade(
+                                        symbol, rp_["side"], float(rp_["qty_abs"]),
+                                        float(rp_.get("avg_price") or 0) or coin_price,
+                                        "readopted",
+                                        leverage=rp_.get("leverage", leverage),
+                                        margin_ccy=rp_.get("margin_ccy", margin_ccy))
+                                    _flip_guard_stats["readopted"] += 1
+                                    log.warning(f"🧲 RE-ADOPTED {symbol} {rp_['side'].upper()} "
+                                                f"{rp_['qty_abs']} from the exchange — ladder "
+                                                f"will arm on the next poll")
+                                    log_trade_event(symbol, rp_["side"], "flip_entry", "READOPT",
+                                                    "untracked leg re-tracked after abort")
+                            except Exception as e_:
+                                log.error(f"re-adopt {symbol} failed: {e_}")
                         return jsonify({"status": "aborted",
                                         "reason": f"flip close on {symbol} did not settle within 4s"}), 200
                     # flat True (verified) or None (API blip after ≥4s polling) → proceed.
@@ -3322,6 +3373,11 @@ def status():
             "last_closed": _flatten_last_closed,
             "fires_since_boot": _flatten_count,
             "last_error": _flatten_last_error,
+        },
+        "flip_guard": {
+            "fresh_grace_sec": FLIP_FRESH_GRACE_SEC,
+            "fresh_skips": _flip_guard_stats["fresh_skips"],
+            "readopted": _flip_guard_stats["readopted"],
         },
         "flat_only": {
             "supported": True,
