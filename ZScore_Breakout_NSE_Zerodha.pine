@@ -1,0 +1,1150 @@
+// Z-Score Breakout signal engine — verbatim from the source build.
+// NSE / Zerodha variant: only the symbol mapper and title differ from the CoinDCX chassis
+// (ZScore_Breakout_chassis.pine md5 a1e7251c…). Webhook payload is byte-identical in shape.
+// Entry-only chassis, ladder sim, cost model, governor, gates (incl. MFE),
+// sim re-sync, server sync, labeled field and dashboard: fleet standard.
+
+//@version=5
+indicator("Z-Score Breakout — ENTRY+SYNC → Zerodha options (server owns exits) [μ/σ + Gov + Gates + Costs + Re-sync]", shorttitle="Z-Score — NSE SYNC", overlay=true, max_labels_count=500, max_bars_back=1000)
+
+// ═══════════════════════════════════════════════════════════
+//  Z-SCORE BREAKOUT · ENTRY-ONLY · FLIP · SIM RE-SYNC · SERVER SYNC
+//
+//  SIGNAL — verbatim. Over a trailing N-hour window, μ = SMA(close),
+//  σ = STDEV(close) clamped to [floor%, ceil%] of price, z = (close − μ)/σ.
+//    • BREAKOUT (default): long when z crosses ABOVE +k, short when z crosses
+//      BELOW −k.   • MEAN-REVERSION: same math, sides swapped.
+//  `started` blocks every signal until a full window of bars exists.
+//
+//  DISCRETE SCALPER, as the source: an entry needs a band break in the
+//  direction OPPOSITE to the last entry. After a ladder exit the sim sits flat
+//  until the opposite break (or re-enters on a same-side break if Re-enter is
+//  ON). "Wait bars" blocks entries for N bars after any entry or ladder exit.
+//  An opposite break while in a trade FLIPS the position, and the server does
+//  the same (opposite-direction entry = close + reopen). flat_only is NOT sent.
+//
+//  WINDOW vs CHART HISTORY: the window is converted to bars from the chart
+//  timeframe. On a 1s chart 24 h = 86,400 bars — more than TradingView loads
+//  (~35–40k bars ≈ 10–11 h), so the bot would never warm up. On 1s keep the
+//  window well under the loaded history (the Z · band row shows bars needed).
+//
+// ─────────────────────────────────────────────────────────────
+//  SIM RE-SYNC — chart = alert without a date input
+// ─────────────────────────────────────────────────────────────
+//  Which break is "opposite to the last entry", and whether Wait bars blocks
+//  it, depend on the sim's own trade history since the runtime's first bar, so
+//  the chart and an alert can occasionally draw different labels. Every N
+//  hours, on fixed clock boundaries (multiples of N hours from 00:00 UTC), the
+//  sim is forced FLAT, its cooldown restarts, and its last direction is set to
+//  the direction of the most recent band break — a value every runtime
+//  computes the same way. From that bar every runtime is in the same state and
+//  draws the same labels. The next entry is still the next OPPOSITE break, so
+//  the re-sync does not create entries of its own.
+//  A sim trade open at a boundary is closed at that bar's close and booked
+//  under "Flip / re-sync exits" (label ⟳ RE-SYNC). NOTHING is sent to the
+//  server — it keeps its position; the next opposite label flips it.
+//  A runtime that has not yet seen a boundary after warm-up (full window) is
+//  MUTED until the next one. Warm-up + re-sync period must fit inside the
+//  history the chart loads, or a new alert stays muted until a boundary.
+//
+// ─────────────────────────────────────────────────────────────
+//  SERVER SYNC
+// ─────────────────────────────────────────────────────────────
+//  `srvDir` tracks what Pine BELIEVES the server holds, mutated ONLY when an
+//  alert fires:
+//    • gates open                      → fire `entry`,  srvDir := newSignal
+//    • gates blocked, srvDir opposite  → fire `close`,  srvDir := 0
+//    • gates blocked, srvDir already 0 → nothing
+//    • gates blocked, srvDir same side → nothing
+//  srvDir is NOT cleared on a sim ladder exit or a re-sync: if the server is
+//  still holding, a gate-blocked opposite signal must still be able to send
+//  its close (an untracked close is a harmless no-op on the server).
+//  THE SIM NEVER STOPS — it keeps trading regardless of gates so the stats keep
+//  updating and a latched gate can reopen. Equity / Return% / Kill describe the
+//  HYPOTHETICAL ungated strategy, not the server.
+//
+//  LADDER MIRROR DEFAULTS: SL 3% · rung 0.6% · book 33% · 2 books — the live
+//  server values seen in the October logs. CONFIRM AGAINST /status BEFORE
+//  ARMING. The source's 10% / 2% defaults are gone.
+//
+//  COST MODEL: every sim fill is slipped by i_slipBps and pays i_feeBps;
+//  funding (i_fundBps per 8h) is charged on open notional every confirmed bar.
+//  WR, P&L, Equity and the gates are all NET of costs.
+//
+//  LABELED FIELD: entry webhooks carry "labeled":"1" when a sim entry (and its
+//  chart label) happened on that bar, "0" on the resync path. server2.py
+//  REJECTS "0", so Resync defaults OFF and srvDir seeds from the signal.
+//
+//  GOVERNOR defaults OFF (0): every fired entry counts against it, including
+//  ones the server skips, and a small cap silently blocks most labels.
+//
+//  MFE GATE CHASSIS: MFE reach = % of closed trades whose max favourable
+//  excursion reached i_mfePct % of one rung. Annih-before-MFE = an annihilation
+//  (ladder SL at the initial stop, zero books) that never reached that level.
+//
+//  BAR CLOSE ONLY: the source's intrabar sim option is gone — the server owns
+//  intrabar exits; Pine only decides entries at bar close.
+//
+//  COUPLING: only arm against a server running SERVER_EXITS_ENABLED=true.
+// ═══════════════════════════════════════════════════════════
+
+// ═══════════════════════════════════════════════════════════
+//  INPUTS — SIGNAL ENGINE (Z-Score) — source values
+// ═══════════════════════════════════════════════════════════
+grpSig    = "Signal — Z-Score"
+i_mode    = input.string("Breakout", "Signal Mode", options=["Breakout", "Mean-Reversion"], group=grpSig)
+i_k       = input.float(2.0, "Band Multiplier (σ)", minval=0.1, step=0.1, group=grpSig, tooltip="Entry fires when |z| crosses this many σ. 2.0 ≈ the classic ~2σ band. Higher = rarer, more extreme breakouts.")
+i_winHrs  = input.float(24.0, "Lookback Window (hours)", minval=0.01, step=0.5, group=grpSig, tooltip="μ and σ over this trailing wall-clock window, converted to bars from the chart timeframe. On a 1s chart 24 h = 86,400 bars, more than the chart loads — keep it well under the loaded history there.")
+i_sdFloorPct = input.float(0.05, "σ Floor (% of price)", minval=0.0, step=0.01, group=grpSig, tooltip="Clamp σ to at least this % of price. Prevents z exploding on a flat window (σ→0).") / 100
+i_sdCeilPct  = input.float(5.0,  "σ Ceil (% of price)",  minval=0.1, step=0.1, group=grpSig, tooltip="Clamp σ to at most this % of price. Outlier-bar guard.") / 100
+i_reenter = input.bool(false, "Re-enter on same-side band break while flat", group=grpSig, tooltip="OFF (default) = source-faithful discrete scalper: after a ladder exit the sim sits FLAT until the OPPOSITE band breaks. ON = a same-side break while flat re-enters.")
+i_wait    = input.int(0, "Wait Bars Between Trades", minval=0, group=grpSig, tooltip="Cooldown bars after ANY sim entry or ladder exit before the next entry. 0 = enter at the next bar close.")
+
+grpRs         = "Sim re-sync · chart = alert"
+i_simResetHrs = input.float(6.0, "Re-sync the sim every N hours (0 = off)", minval=0.0, step=1.0, group=grpRs, tooltip="On fixed clock boundaries the sim is forced flat and its last direction set to the latest band break, so the chart and every alert draw the same labels from then on. Warm-up (the full window) + this period must fit in the history a chart loads, or a new alert is muted until a boundary. 0 = off.")
+
+// ═══════════════════════════════════════════════════════════
+//  INPUTS — LADDER MIRROR (display only; server env is the truth)
+// ═══════════════════════════════════════════════════════════
+grpLad    = "Ladder mirror (must match server env)"
+i_slPct   = input.float(3.0,  "Ladder SL %  (mirror SL_PCT)",              step=0.5, minval=0.1, group=grpLad) / 100
+i_tpStep  = input.float(0.6,  "TP rung step %  (mirror TP_STEP_PCT)",      step=0.05, minval=0.05, group=grpLad) / 100
+i_book    = input.float(33.0, "Book % of ORIGINAL per rung  (mirror BOOK_PCT)", step=1, group=grpLad) / 100
+i_maxBook = input.int(2, "Max books before pure trail  (mirror MAX_BOOKS)", minval=0, maxval=5, group=grpLad)
+
+// ═══════════════════════════════════════════════════════════
+//  INPUTS — SERVER SYNC
+// ═══════════════════════════════════════════════════════════
+grpSync      = "Server Sync"
+i_flatten    = input.bool(true, "Flatten on gate block (send close webhook)", group=grpSync, tooltip="MASTER SWITCH for the desync fix. A signal whose entry is blocked by a gate sends a CLOSE webhook instead of going silent.")
+i_govFlatten = input.bool(true, "Governor block also flattens", group=grpSync, tooltip="ON = 'too much churn, go flat'. OFF = the governor is the one gate that still strands the server, and resync cannot rescue it (resync requires srvDir == 0).")
+i_resync     = input.bool(false, "Resync entry when gates reopen", group=grpSync, tooltip="When gates reopen while the server is believed FLAT but the SIM still holds, fire a catch-up entry. Resync entries carry labeled 0, which server2.py rejects — leave OFF.")
+i_resyncBars = input.int(3, "Resync: bars to wait after a flatten", minval=0, group=grpSync)
+i_srvSeed    = input.string("Seed from signal", "srvDir on script reload", options=["Reset to flat", "Seed from signal"], group=grpSync, tooltip="srvDir is varip — it resets on reload while the server's active_trades persists to disk. Reset to flat errs toward SENDING (a redundant entry is a server no-op).")
+
+// ═══════════════════════════════════════════════════════════
+//  INPUTS — WR GATE / ANNIHILATION GATE
+// ═══════════════════════════════════════════════════════════
+grpGate      = "WR Gate"
+i_wrGate     = input.bool(false, "WR Gate: alert ONLY while WR > Breakeven WR", group=grpGate)
+i_wrGateMin  = input.int(5, "WR Gate: min completed trades", group=grpGate, minval=0)
+i_wrGateHyst = input.float(4.0, "WR Gate: hysteresis (pp above BE to reopen)", group=grpGate, minval=0.0, step=0.5, tooltip="The gate LATCHES: blocks at WR <= beWR, reopens only at WR > beWR + this. Mandatory with Flatten on.")
+
+grpAnn    = "Annihilation Gate"
+i_annGate = input.bool(false, "Annihilation Gate: alert ONLY while count < threshold", group=grpAnn, tooltip="Annihilation = a ladder SL exit at the INITIAL stop with ZERO books. Cumulative over chart history, never resets.")
+i_annMax  = input.int(1, "Annihilation Gate: threshold", group=grpAnn, minval=1)
+
+grpAnnMfe    = "Annih-before-MFE Gate"
+i_annMfeGate = input.bool(false, "Annih-before-MFE Gate: alert ONLY while count < threshold", group=grpAnnMfe, tooltip="Counts annihilations that ALSO never reached the MFE target first — trades wrong from the first bar. Cumulative, never resets; zero-tolerance by default. Blocks the ALERT only.")
+i_annMfeMax  = input.int(1, "Annih-before-MFE Gate: threshold", group=grpAnnMfe, minval=1)
+
+grpMfe            = "MFE Reach Gate"
+i_mfePct          = input.float(33.0, "MFE target (% of one rung)", minval=1.0, maxval=500.0, step=1.0, group=grpMfe, tooltip="A trade reaches MFE when its max favourable excursion hits this % of the TP rung step. 33% × 0.6% = 0.198% price move.")
+i_mfeGate         = input.bool(false, "MFE Gate: alert ONLY while MFE reach % ≥ threshold", group=grpMfe, tooltip="Hysteretic latch, same shape as the WR gate. Blocks the ALERT only — sim keeps running so the gate can reopen.")
+i_mfeGateMin      = input.int(5, "MFE Gate: min closed trades", minval=1, group=grpMfe)
+i_mfeThreshold    = input.float(80.0, "MFE Gate: block when reach % <", minval=0.0, maxval=100.0, step=1.0, group=grpMfe)
+i_mfeResumeBuffer = input.float(5.0, "MFE Gate: reopen buffer (pp)", minval=0.0, step=0.5, group=grpMfe)
+
+grpPos         = "Positive-Trades Gate"
+i_posGate      = input.bool(false, "Positive Gate: alert ONLY while positive trades % ≥ threshold", group=grpPos, tooltip="Positive = closed above 0 after costs OR reached the MFE target. Hysteretic latch like the MFE gate: blocks below the threshold, reopens at threshold + buffer. Blocks the ALERT only — the sim keeps running so the gate can reopen.")
+i_posBasis     = input.string("Sim", "Positive Gate: measure", options=["Sim", "Signal"], group=grpPos, tooltip="Sim = the ladder sim's trades (what the server's ladder would do). Signal = hold each signal to the next opposite signal.")
+i_posGateMin   = input.int(5, "Positive Gate: min closed trades", minval=1, group=grpPos)
+i_posThreshold = input.float(60.0, "Positive Gate: block when positive % <", minval=0.0, maxval=100.0, step=1.0, group=grpPos)
+i_posResume    = input.float(5.0, "Positive Gate: reopen buffer (pp)", minval=0.0, step=0.5, group=grpPos)
+
+grpCost   = "Cost model (sim)"
+i_feeBps  = input.float(5.0, "Fee per fill (bps of notional)", minval=0.0, step=0.5, group=grpCost, tooltip="Taker fee charged on every sim fill: entry, each book, SL/trail exit, flip exit. 5 bps = 0.05%.")
+i_slipBps = input.float(3.0, "Slippage per fill (bps)", minval=0.0, step=0.5, group=grpCost, tooltip="Every fill price is moved against you by this much.")
+i_fundBps = input.float(1.0, "Funding (bps per 8h on open notional)", minval=0.0, step=0.1, group=grpCost, tooltip="Charged as a cost every confirmed bar while in a position, pro-rated to the bar length.")
+
+// ═══════════════════════════════════════════════════════════
+//  INPUTS — GOVERNOR / KILL / DISPLAY / WEBHOOK
+// ═══════════════════════════════════════════════════════════
+grpGov         = "Governor"
+i_govMaxTrades = input.int(0, "Max Entries per Window (0 = off)", minval=0, group=grpGov, tooltip="Counts every fired entry including resyncs and including entries the server then skips. Flatten closes do NOT count. Default OFF: on a 1s chart a small cap silently blocks almost every label. Each alert counts only its own sends.")
+i_govWindowHrs = input.float(24.0, "Window (hours)", minval=0.1, step=0.5, group=grpGov)
+
+grpEvid      = "Min-Entries Gate (evidence)"
+i_minEntries = input.int(1, "Min sim entries on chart before alerts", minval=0, maxval=500, group=grpEvid, tooltip="No webhook fires until the sim has ALREADY produced at least this many entries on the loaded history — i.e. until the 'Entries (Re)' row reads at least this number, which is the same as at least one entry LABEL being visible on the chart. The count EXCLUDES the entry currently being evaluated, so 1 means the very first sim entry on a chart is sim-only and the second onward fire. Gates RESYNCS too. 0 = disabled.")
+
+grpRisk        = "Risk"
+i_minPnl  = input.float(0.0, "Min Net P&L % (kill switch, 0=off)", step=0.5, group=grpRisk, tooltip="PAUSES new entries. NEGATIVE = drawdown stop armed from bar one. POSITIVE = profit lock, arms only after Return% first reaches (this + Resume Buffer). Uses the COMPOUNDED Return%, not the arithmetic sum.")
+i_resumeBuffer = input.float(2.0, "Resume Buffer %", step=0.5, group=grpRisk)
+i_subCentGuard = input.bool(true, "Sub-cent equity guard", group=grpRisk, tooltip="On sub-cent pairs the price-relative compounding drives Return% to a meaningless -100%. When ON, Equity/Return%/Avg Mo show 'n/a'. Net P&L % (sum) is arithmetic and stays valid, so it is NOT suppressed.")
+i_subCentPx    = input.float(0.01, "Sub-cent threshold (price)", step=0.001, group=grpRisk)
+
+i_secret  = input.string("", "Webhook Secret")
+i_lev     = input.int(5, "Leverage", minval=1)
+i_margin  = input.string("INR", "Margin Currency", options=["INR", "USDT"])
+
+// ═══════════════════════════════════════════════════════════
+//  INPUTS — DASHBOARD ROW VISIBILITY (rows compact; no gaps)
+// ═══════════════════════════════════════════════════════════
+grpDash    = "Dashboard rows"
+i_shStrategy = input.bool(true,  "Strategy",     group=grpDash, inline="d1")
+i_shPair     = input.bool(true,  "Pair",         group=grpDash, inline="d1")
+i_shCanTrade = input.bool(true,  "TRADE? verdict", group=grpDash, inline="d1")
+i_shZCfg     = input.bool(false, "Z cfg",        group=grpDash, inline="d1b")
+i_shZNow     = input.bool(true,  "Z · band",     group=grpDash, inline="d2")
+i_shRawSig   = input.bool(false, "Raw signals",  group=grpDash, inline="d2")
+i_shBars     = input.bool(false, "Trade bars",   group=grpDash, inline="d2")
+i_shAvgBars  = input.bool(false, "Avg win bars", group=grpDash, inline="d3")
+i_shEntries  = input.bool(true,  "Entries",      group=grpDash, inline="d3")
+i_shMinEnt   = input.bool(false, "Min-Entries Gate", group=grpDash, inline="d3b")
+i_shLS       = input.bool(false, "Long/Short",   group=grpDash, inline="d3")
+i_shWR       = input.bool(true,  "Win Rate",     group=grpDash, inline="d4")
+i_shPosRet   = input.bool(true,  "Positive trades %", group=grpDash, inline="d4b", tooltip="A trade counts as POSITIVE if it closed with a return above 0 after costs OR it reached the MFE target (MFE reach gate) before closing. SIM = the ladder sim's trades. SIGNAL = each signal held until the next opposite signal, no ladder, round-trip fee + slippage deducted, MFE measured from the signal price.")
+i_shPosGate  = input.bool(false, "Positive Gate", group=grpDash, inline="d13b")
+i_shLongWR   = input.bool(false, "Long WR%",     group=grpDash, inline="d4")
+i_shShortWR  = input.bool(false, "Short WR%",    group=grpDash, inline="d4")
+i_shBooks    = input.bool(false, "TP Books",     group=grpDash, inline="d5")
+i_shLosses   = input.bool(false, "Real Losses",  group=grpDash, inline="d5")
+i_shAnnih    = input.bool(false, "Annihilations",group=grpDash, inline="d5")
+i_shAnnihMfe = input.bool(true,  "Annih before MFE", group=grpDash, inline="d5b")
+i_shSlExits  = input.bool(false, "SL exits",     group=grpDash, inline="d6")
+i_shFlipEx   = input.bool(false, "Flip exits",   group=grpDash, inline="d6")
+i_shBW       = input.bool(true,  "Best / Worst", group=grpDash, inline="d6b")
+i_shMfeReach = input.bool(true,  "MFE reach",    group=grpDash, inline="d6b")
+i_shTpPts    = input.bool(false, "Sum TP Pts",   group=grpDash, inline="d6")
+i_shSlPts    = input.bool(false, "Sum SL Pts",   group=grpDash, inline="d7")
+i_shTrail    = input.bool(false, "Trail Outs",   group=grpDash, inline="d7")
+i_shCost     = input.bool(false, "Costs",        group=grpDash, inline="d7")
+i_shNetPnl   = input.bool(false, "Net P&L pts",  group=grpDash, inline="d7b")
+i_shNetPct   = input.bool(true,  "Net P&L % (after costs)", group=grpDash, inline="d8", tooltip="Arithmetic sum of every closed trade's return %, net of fees, slippage and funding. Not compounded, and not suppressed by the sub-cent guard.")
+i_shLadder   = input.bool(false, "Ladder mirror",group=grpDash, inline="d8")
+i_shBooksDn  = input.bool(false, "Books Done",   group=grpDash, inline="d8")
+i_shGov      = input.bool(false, "Entry Gov",    group=grpDash, inline="d9")
+i_shSigPos   = input.bool(false, "Signal Pos",   group=grpDash, inline="d9")
+i_shCurPnl   = input.bool(true,  "Cur P&L%",     group=grpDash, inline="d9")
+i_shState    = input.bool(true,  "State",        group=grpDash, inline="d10")
+i_shEquity   = input.bool(true,  "Equity",       group=grpDash, inline="d10")
+i_shReturn   = input.bool(true,  "Return %",     group=grpDash, inline="d10")
+i_shAvgMo    = input.bool(false, "Avg Mo Ret%",  group=grpDash, inline="d11")
+i_shKill     = input.bool(false, "Kill @",       group=grpDash, inline="d11")
+i_shResume   = input.bool(false, "Resume @",     group=grpDash, inline="d11")
+i_shAvgWin   = input.bool(false, "Avg Win%",     group=grpDash, inline="d12")
+i_shAvgLoss  = input.bool(false, "Avg Loss%",    group=grpDash, inline="d12")
+i_shBeWR     = input.bool(false, "Breakeven WR", group=grpDash, inline="d12")
+i_shWrGateR  = input.bool(false, "WR Gate",      group=grpDash, inline="d13")
+i_shAnnGateR = input.bool(false, "Annih Gate",   group=grpDash, inline="d13")
+i_shAnnMfeGateR = input.bool(false, "Annih-MFE Gate", group=grpDash, inline="d13b")
+i_shMfeGate  = input.bool(false, "MFE Gate",     group=grpDash, inline="d13b")
+i_shSrvPos   = input.bool(true,  "Srv Pos",      group=grpDash, inline="d13")
+i_shSync     = input.bool(false, "Sync",         group=grpDash, inline="d14")
+
+// ═══════════════════════════════════════════════════════════
+//  WINDOW LENGTH — derived from timeframe (TF-agnostic)
+// ═══════════════════════════════════════════════════════════
+int len = math.max(2, math.round(i_winHrs * 3600.0 / timeframe.in_seconds()))
+
+// ═══════════════════════════════════════════════════════════
+//  Z-SCORE ENGINE — rolling z-score with σ clamp + warmup gate. Verbatim.
+// ═══════════════════════════════════════════════════════════
+float mean  = ta.sma(close, len)
+float sdRaw = ta.stdev(close, len)
+float sdFlr = close * i_sdFloorPct
+float sdCl  = close * i_sdCeilPct
+float sd    = na(sdRaw) ? na : math.min(math.max(sdRaw, sdFlr), sdCl)
+float z     = (not na(sd) and sd > 0) ? (close - mean) / sd : na
+float upper = (not na(mean) and not na(sd)) ? mean + i_k * sd : na
+float lower = (not na(mean) and not na(sd)) ? mean - i_k * sd : na
+
+bool started = not na(z) and bar_index >= len
+
+bool xUp   = ta.crossover(z,  i_k)
+bool xDn   = ta.crossunder(z, -i_k)
+bool rawBuy  = i_mode == "Breakout" ? xUp : xDn
+bool rawSell = i_mode == "Breakout" ? xDn : xUp
+
+// Direction of the most recent band break — depends on recent bars only, so
+// every runtime agrees on it. The re-sync seeds the sim's direction from it.
+// ─── positive-return metric ───
+varip int   posSimTrades = 0        // sim closes counted positive (net > 0 or MFE reached)
+varip float sigEntryPx   = na       // signal-to-signal: price at the last band break
+varip int   sigHoldDir   = 0
+varip int   sigTrades    = 0
+varip int   sigPosTrades = 0
+varip float sigSumRet    = 0.0
+varip float sigMfe       = 0.0      // signal-to-signal max favourable excursion (fraction)
+varip int   sigEntryBar  = -1
+varip bool  posGateLatch = true
+varip int   posGateBlockCnt = 0
+
+var int lastRawDir = 0
+if barstate.isconfirmed and started and (rawBuy or rawSell)
+    lastRawDir := rawBuy ? 1 : -1
+
+// ═══════════════════════════════════════════════════════════
+//  SYMBOL — TradingView NSE chart → Zerodha underlying
+//  NSE:HAVELLS → "HAVELLS". The server (Zerodha options) folds TradingView
+//  spellings onto Kite names: BAJAJ_AUTO → BAJAJ-AUTO, M_M → M&M,
+//  NIFTY1! → NIFTY, CNXFINANCE → FINNIFTY. Override only if a chart's
+//  ticker is not an F&O underlying name (e.g. a custom index symbol).
+// ═══════════════════════════════════════════════════════════
+i_undOverride = input.string("", "Underlying override (blank = chart ticker)")
+f_cdcx_pair() =>
+    str.length(i_undOverride) > 0 ? str.upper(i_undOverride) : syminfo.ticker
+cdcxPair = f_cdcx_pair()
+
+// ═══════════════════════════════════════════════════════════
+//  STATE — varip (chassis-standard)
+// ═══════════════════════════════════════════════════════════
+varip int   dir       = 0
+varip float simQty    = 0.0
+varip float simOrig   = 1.0
+varip float simAvg    = na
+varip float simSL     = na
+varip int   simBooks  = 0
+varip int   entryBarIdx = -1
+varip float tradePnL  = 0.0
+varip bool  simInPos  = false
+
+varip int   entryFiredBar = -1
+
+// ─── SERVER SYNC STATE ───
+varip int   srvDir      = 0
+varip bool  srvSeeded   = false
+varip int   flattenCnt  = 0
+varip int   resyncCnt   = 0
+varip int   lastFlatBar = -100000
+
+varip array<int> govEntries = array.new_int(0)
+
+varip float cumPnL   = 0.0
+varip float sumTpPts = 0.0
+varip float sumSlPts = 0.0
+varip float sumTrailPts = 0.0
+varip int   trailOuts = 0
+varip int   annihilations = 0
+varip int   slExits  = 0
+varip int   flipExits = 0
+varip int   reentries = 0
+varip int   tpBooks  = 0
+varip int   longT    = 0
+varip int   shortT   = 0
+varip int   longW    = 0
+varip int   shortW   = 0
+varip float equity   = 10000.0
+varip bool  wasKilled = false
+varip bool  killArmedPos = false
+
+varip float sumWinPct  = 0.0
+varip float sumLossPct = 0.0
+
+// ─── signal diagnostics ───
+varip int rawBuyCnt   = 0
+varip int rawSellCnt  = 0
+varip int lastTradeBar = 0          // cooldown anchor: last sim entry or ladder exit
+
+// ─── sim re-sync ───
+varip bool  seenSimReset = false    // this runtime has passed a re-sync boundary (after warm-up)
+varip int   simResetCnt  = 0
+
+varip bool wrGateLatch    = true
+varip int  wrGateBlockCnt = 0
+varip int  annGateBlockCnt = 0
+
+// ─── MFE chassis state ───
+varip int   annihBeforeMfe        = 0
+varip float runMFE                = na
+varip int   mfeHitCount           = 0
+varip int   mfeTotal              = 0
+varip bool  mfeGateLatch          = true
+varip int   mfeGateBlockCnt       = 0
+varip int   annMfeGateBlockCnt    = 0
+varip bool  mfeTargetHitThisTrade = false
+varip float bestTradePct          = na
+varip float worstTradePct         = na
+varip float sumCostPts            = 0.0
+// bars-in-trade for WINNING closes, per side (source's timing rows)
+varip float winBarsLong   = 0.0
+varip int   winCntLong    = 0
+varip float winBarsShort  = 0.0
+varip int   winCntShort   = 0
+
+var array<float> monthlyReturns = array.new_float(0)
+var float prevMonthEquity       = na
+var int   prevMonth             = na
+
+bool  fEntry      = false
+bool  fMfeHit     = false
+bool  fEntryAlert = false
+bool  fFlatAlert  = false
+int   flatDir     = 0
+float flatPct     = 0.0
+
+varip bool  pendFlat    = false
+varip float pendFlatPct = 0.0
+varip int   pendFlatDir = 0
+varip bool  pendBook    = false
+varip int   pendBookN   = 0
+varip int   pendBookDir = 0
+varip bool  pendFlipLbl = false
+varip bool  pendFlipSync = false
+varip float pendFlipPct = 0.0
+varip int   pendFlipDir = 0
+
+// ═══════════════════════════════════════════════════════════
+//  GOVERNOR — prune, then compute free slots and the headroom gate
+// ═══════════════════════════════════════════════════════════
+int govWindowMs = int(i_govWindowHrs * 60.0 * 60.0 * 1000.0)
+int govCutoff   = time - govWindowMs
+if i_govMaxTrades > 0
+    bool keepPruning = true
+    while keepPruning
+        if array.size(govEntries) > 0
+            if array.get(govEntries, 0) <= govCutoff
+                array.shift(govEntries)
+            else
+                keepPruning := false
+        else
+            keepPruning := false
+
+int  govCount = array.size(govEntries)
+bool govGated = i_govMaxTrades > 0 and govCount >= i_govMaxTrades
+
+// ═══════════════════════════════════════════════════════════
+//  SIM LADDER HELPERS — mirror of the server's _ladder_* functions
+// ═══════════════════════════════════════════════════════════
+f_slInitial(int d, float avg) =>
+    d == 1 ? avg * (1.0 - i_slPct) : avg * (1.0 + i_slPct)
+
+f_slTarget(int d, float avg, int k) =>
+    k <= 0 ? f_slInitial(d, avg) : d == 1 ? avg * (1.0 + i_tpStep * (k - 1)) : avg * (1.0 - i_tpStep * (k - 1))
+
+f_ratchet(int d, float cur, float target) =>
+    na(cur) ? target : na(target) ? cur : d == 1 ? math.max(cur, target) : math.min(cur, target)
+
+f_rungs(int d, float px, float avg) =>
+    avg <= 0 or px <= 0 ? 0 : math.max(0, int(math.floor((d == 1 ? (px - avg) / avg : (avg - px) / avg) / i_tpStep)))
+
+f_pnlPts(int d, float avg, float px, float q) =>
+    d == 1 ? q * (px - avg) : q * (avg - px)
+
+// ─── COST MODEL ───
+float feeRate      = i_feeBps / 10000.0
+float slipRate     = i_slipBps / 10000.0
+float fundPerBar   = i_fundBps / 10000.0 * timeframe.in_seconds() / 28800.0
+float mfeThresholdFrac = (i_mfePct / 100.0) * i_tpStep
+
+// side: +1 = buying, -1 = selling. Slippage always moves the fill against you.
+f_fill(int side, float px) =>
+    side == 1 ? px * (1.0 + slipRate) : px * (1.0 - slipRate)
+
+f_fee(float q, float px) =>
+    q * px * feeRate
+
+// ═══════════════════════════════════════════════════════════
+//  FIRST BAR
+// ═══════════════════════════════════════════════════════════
+if barstate.isfirst
+    equity          := 10000.0
+    prevMonthEquity := 10000.0
+    prevMonth       := month
+
+if not barstate.isfirst and not na(prevMonth) and month != prevMonth
+    float snapEquity = equity
+    if simInPos and simQty > 0 and not na(simAvg) and simAvg > 0
+        snapEquity := equity * (1 + (dir == 1 ? (close[1] - simAvg) / simAvg : (simAvg - close[1]) / simAvg))
+    if not na(prevMonthEquity) and prevMonthEquity != 0
+        array.push(monthlyReturns, (snapEquity - prevMonthEquity) / prevMonthEquity * 100)
+    prevMonthEquity := snapEquity
+    prevMonth       := month
+
+// ═══════════════════════════════════════════════════════════
+//  SIM RE-SYNC
+// ═══════════════════════════════════════════════════════════
+// ─── SIM RE-SYNC — force the sim flat on fixed clock boundaries ───
+// bucketStart is the same number on every runtime for a given bar, so the
+// boundary bar is the same bar everywhere. Runs FIRST on the bar: the sim goes
+// flat, the cooldown restarts, and `dir` takes the direction of the latest band
+// break, so the next entry is still the next OPPOSITE break.
+int  simResetMs  = int(i_simResetHrs * 3600000.0)
+int  simResetDiv = math.max(simResetMs, 1)
+int  bucketStart = time - (time % simResetDiv)
+bool simResetNow = simResetMs > 0 and not barstate.isfirst and bucketStart != nz(bucketStart[1], bucketStart)
+int  simWarmBars = len + 2
+
+if barstate.isconfirmed and simResetNow
+    if simInPos and simQty > 0 and not na(simAvg)
+        float rsFill = f_fill(-dir, close)
+        float rsPnL  = f_pnlPts(dir, simAvg, rsFill, simQty)
+        float rsFee  = f_fee(simQty, rsFill)
+        cumPnL     += rsPnL - rsFee
+        tradePnL   += rsPnL - rsFee
+        sumCostPts += rsFee
+        if rsPnL >= 0
+            sumTrailPts += rsPnL
+            trailOuts   += 1
+        else
+            sumSlPts += rsPnL
+        flipExits += 1
+        float rsPct = tradePnL / simAvg * 100
+        mfeTotal += 1
+        if mfeTargetHitThisTrade
+            mfeHitCount += 1
+        runMFE := na
+        bestTradePct  := na(bestTradePct)  ? rsPct : math.max(bestTradePct, rsPct)
+        if rsPct > 0 or mfeTargetHitThisTrade
+            posSimTrades += 1
+        worstTradePct := na(worstTradePct) ? rsPct : math.min(worstTradePct, rsPct)
+        if tradePnL >= 0
+            if dir == 1
+                longW += 1
+            else
+                shortW += 1
+            sumWinPct += rsPct
+        else
+            sumLossPct += rsPct
+        equity := equity * (1 + tradePnL / simAvg)
+        pendFlipLbl  := true
+        pendFlipPct  := rsPct
+        pendFlipDir  := dir
+        pendFlipSync := true
+        simQty   := 0.0
+        simInPos := false
+    dir          := lastRawDir
+    lastTradeBar := bar_index
+    simResetCnt  += 1
+    if started and bar_index >= simWarmBars
+        seenSimReset := true
+
+
+// ═══════════════════════════════════════════════════════════
+//  LADDER SIM (display only — loss-cutter / backstop)
+// ═══════════════════════════════════════════════════════════
+if barstate.isconfirmed and not barstate.isfirst
+    if simInPos and simQty > 0 and not na(simAvg) and bar_index > entryBarIdx
+        // ── funding on open notional, once per confirmed bar ──
+        if fundPerBar > 0
+            float fundCost = simQty * close * fundPerBar
+            cumPnL     -= fundCost
+            tradePnL   -= fundCost
+            sumCostPts += fundCost
+        // ── MFE tracking ──
+        float mfeNow = dir == 1 ? (high - simAvg) / simAvg : (simAvg - low) / simAvg
+        runMFE := na(runMFE) ? math.max(0.0, mfeNow) : math.max(runMFE, mfeNow)
+        if not mfeTargetHitThisTrade and runMFE >= mfeThresholdFrac
+            mfeTargetHitThisTrade := true
+            fMfeHit               := true
+        bool breached = dir == 1 ? low <= simSL : high >= simSL
+        if breached
+            float slFill = f_fill(-dir, simSL)
+            float slPnL  = f_pnlPts(dir, simAvg, slFill, simQty)
+            float slFee  = f_fee(simQty, slFill)
+            cumPnL     += slPnL - slFee
+            tradePnL   += slPnL - slFee
+            sumCostPts += slFee
+            bool wasAnnihilation = false
+            if slPnL >= 0
+                sumTrailPts += slPnL
+                trailOuts   += 1
+            else
+                sumSlPts += slPnL
+                if simBooks == 0
+                    annihilations += 1
+                    wasAnnihilation := true
+            slExits  += 1
+            float closePct = tradePnL / simAvg * 100
+            // ── MFE / annihilation bookkeeping ──
+            bool reachedMfeTarget = mfeTargetHitThisTrade
+            mfeTotal += 1
+            if reachedMfeTarget
+                mfeHitCount += 1
+            if wasAnnihilation and not reachedMfeTarget
+                annihBeforeMfe += 1
+            runMFE := na
+            bestTradePct  := na(bestTradePct)  ? closePct : math.max(bestTradePct, closePct)
+            if closePct > 0 or mfeTargetHitThisTrade
+                posSimTrades += 1
+            worstTradePct := na(worstTradePct) ? closePct : math.min(worstTradePct, closePct)
+            if tradePnL >= 0
+                if dir == 1
+                    longW += 1
+                    winBarsLong += bar_index - entryBarIdx
+                    winCntLong  += 1
+                else
+                    shortW += 1
+                    winBarsShort += bar_index - entryBarIdx
+                    winCntShort  += 1
+                sumWinPct += closePct
+            else
+                sumLossPct += closePct
+            equity := equity * (1 + tradePnL / simAvg)
+            pendFlat    := true
+            pendFlatPct := closePct
+            pendFlatDir := dir
+            simQty   := 0.0
+            simInPos := false
+            lastTradeBar := bar_index
+            // dir UNCHANGED — awaits the opposite band break (or a re-entry if enabled)
+        else
+            float fav = dir == 1 ? high : low
+            int k = f_rungs(dir, fav, simAvg)
+            int targetBooks = math.min(i_maxBook, k)
+            while simBooks < targetBooks and simQty > 0
+                float rungPx = dir == 1 ? simAvg * (1 + i_tpStep * (simBooks + 1)) : simAvg * (1 - i_tpStep * (simBooks + 1))
+                float cq     = math.min(simOrig * i_book, simQty)
+                float bkFill = f_fill(-dir, rungPx)
+                float bkPnL  = f_pnlPts(dir, simAvg, bkFill, cq)
+                float bkFee  = f_fee(cq, bkFill)
+                cumPnL     += bkPnL - bkFee
+                tradePnL   += bkPnL - bkFee
+                sumCostPts += bkFee
+                sumTpPts += bkPnL
+                simQty   -= cq
+                simBooks += 1
+                tpBooks  += 1
+                pendBook    := true
+                pendBookN   := simBooks
+                pendBookDir := dir
+            simSL := f_ratchet(dir, simSL, f_slTarget(dir, simAvg, k))
+
+// ═══════════════════════════════════════════════════════════
+//  SIGNAL DECISION — bar close only, AFTER the ladder (source order: a ladder
+//  exit on this bar restarts the cooldown before the break is checked).
+// ═══════════════════════════════════════════════════════════
+int newSignal = 0
+if barstate.isconfirmed and not barstate.isfirst and started
+    int rawDir = rawBuy ? 1 : rawSell ? -1 : 0
+    if rawDir == 1
+        rawBuyCnt += 1
+    else if rawDir == -1
+        rawSellCnt += 1
+    bool dirOK = i_reenter ? (rawDir != dir or not simInPos) : (rawDir != dir)
+    if rawDir != 0 and dirOK and bar_index > lastTradeBar + i_wait
+        newSignal := rawDir
+
+// ─── SIGNAL-TO-SIGNAL return: hold each band break until the next OPPOSITE one ───
+// Uses the raw breaks (price only), independent of the ladder sim, the
+// cooldown and the re-sync. Round-trip fee + slippage deducted.
+int rawEvt = started and barstate.isconfirmed and not barstate.isfirst ? (rawBuy ? 1 : rawSell ? -1 : 0) : 0
+if barstate.isconfirmed and sigHoldDir != 0 and not na(sigEntryPx) and sigEntryPx > 0 and bar_index > sigEntryBar
+    float sigFav = sigHoldDir == 1 ? (high - sigEntryPx) / sigEntryPx : (sigEntryPx - low) / sigEntryPx
+    sigMfe := math.max(sigMfe, sigFav)
+if rawEvt != 0 and rawEvt != sigHoldDir
+    if sigHoldDir != 0 and not na(sigEntryPx) and sigEntryPx > 0
+        float sigRet = sigHoldDir * (close - sigEntryPx) / sigEntryPx * 100 - 2 * (i_feeBps + i_slipBps) / 100.0
+        sigTrades += 1
+        sigSumRet += sigRet
+        if sigRet > 0 or sigMfe >= mfeThresholdFrac
+            sigPosTrades += 1
+    sigEntryPx  := close
+    sigHoldDir  := rawEvt
+    sigEntryBar := bar_index
+    sigMfe      := 0.0
+
+// ═══════════════════════════════════════════════════════════
+//  EXPECTANCY + GATE VERDICTS — POST-sim, PRE-entry
+// ═══════════════════════════════════════════════════════════
+int   closedTrades = slExits + flipExits
+int   winCount     = longW + shortW
+int   lossCount    = closedTrades - winCount
+float wrPct        = closedTrades > 0 ? winCount * 100.0 / closedTrades : 0.0
+float avgWinPct    = winCount  > 0 ? sumWinPct / winCount : 0.0
+float avgLossPct   = lossCount > 0 ? math.abs(sumLossPct / lossCount) : 0.0
+float beWR         = (avgWinPct + avgLossPct) > 0 ? avgLossPct / (avgWinPct + avgLossPct) * 100 : 0.0
+float wrReopen     = beWR + i_wrGateHyst
+
+// Arithmetic sum of all closed exits — NOT compounded. See header.
+float netPctSum = sumWinPct + sumLossPct
+
+bool wrDataOK = closedTrades > 0 and closedTrades >= i_wrGateMin
+if not i_wrGate or not wrDataOK
+    wrGateLatch := true
+else if barstate.isconfirmed
+    if wrGateLatch and wrPct <= beWR
+        wrGateLatch := false
+    else if not wrGateLatch and wrPct > wrReopen
+        wrGateLatch := true
+
+bool wrGateOK       = not i_wrGate or wrGateLatch
+bool wrGateBlocking = i_wrGate and not wrGateOK
+bool annGateOK      = not i_annGate or annihilations < i_annMax
+bool annGateBlocking = i_annGate and not annGateOK
+bool annMfeGateOK       = not i_annMfeGate or annihBeforeMfe < i_annMfeMax
+bool annMfeGateBlocking = i_annMfeGate and not annMfeGateOK
+
+float mfeHitPct = mfeTotal > 0 ? mfeHitCount * 100.0 / mfeTotal : 0.0
+bool  mfeDataOK = mfeTotal >= i_mfeGateMin
+if not i_mfeGate or not mfeDataOK
+    mfeGateLatch := true
+else if barstate.isconfirmed
+    if mfeGateLatch and mfeHitPct < i_mfeThreshold
+        mfeGateLatch := false
+    else if not mfeGateLatch and mfeHitPct >= i_mfeThreshold + i_mfeResumeBuffer
+        mfeGateLatch := true
+bool mfeGateOK       = not i_mfeGate or mfeGateLatch
+bool mfeGateBlocking = i_mfeGate and not mfeGateOK
+
+// ─── POSITIVE-TRADES GATE (positive = net > 0 OR MFE reached) ───
+float posSimPctG = closedTrades > 0 ? posSimTrades * 100.0 / closedTrades : 0.0
+float posSigPctG = sigTrades > 0 ? sigPosTrades * 100.0 / sigTrades : 0.0
+float posGateVal = i_posBasis == "Sim" ? posSimPctG : posSigPctG
+int   posGateN   = i_posBasis == "Sim" ? closedTrades : sigTrades
+bool  posDataOK  = posGateN >= i_posGateMin
+if not i_posGate or not posDataOK
+    posGateLatch := true
+else if barstate.isconfirmed
+    if posGateLatch and posGateVal < i_posThreshold
+        posGateLatch := false
+    else if not posGateLatch and posGateVal >= i_posThreshold + i_posResume
+        posGateLatch := true
+bool posGateOK       = not i_posGate or posGateLatch
+bool posGateBlocking = i_posGate and not posGateOK
+
+// ─── MIN-ENTRIES (EVIDENCE) GATE ───
+// Read PRE-entry, so this is the count of PRIOR sim entries. See header.
+int  simEntries      = longT + shortT
+bool minEntOK        = i_minEntries <= 0 or simEntries >= i_minEntries
+bool minEntBlocking  = i_minEntries > 0 and not minEntOK
+
+bool blockNonGov    = wasKilled or not wrGateOK or not annGateOK or not annMfeGateOK or not minEntOK or not mfeGateOK or not posGateOK
+// Muted until this runtime's sim has been re-synced at least once.
+bool syncReady      = simResetMs == 0 or seenSimReset
+bool entryAllowed   = not govGated and not blockNonGov and syncReady
+bool flattenAllowed = i_flatten and (blockNonGov or (govGated and i_govFlatten)) and syncReady
+
+if not srvSeeded and barstate.isrealtime
+    srvDir    := i_srvSeed == "Seed from signal" and simInPos ? dir : 0
+    srvSeeded := true
+
+// ═══════════════════════════════════════════════════════════
+//  ENTRY LOGIC — server-mirrored, with the three-way sync decision
+// ═══════════════════════════════════════════════════════════
+if barstate.isconfirmed and not barstate.isfirst
+    if newSignal != 0 and (newSignal != dir or not simInPos)
+        bool isReentry = (not simInPos) and newSignal == dir
+        float closedPct = 0.0
+
+        if simInPos and simQty > 0 and not na(simAvg)
+            float flipFill = f_fill(-dir, close)
+            float flipPnL  = f_pnlPts(dir, simAvg, flipFill, simQty)
+            float flipFee  = f_fee(simQty, flipFill)
+            cumPnL     += flipPnL - flipFee
+            tradePnL   += flipPnL - flipFee
+            sumCostPts += flipFee
+            if flipPnL >= 0
+                sumTrailPts += flipPnL
+                trailOuts   += 1
+            else
+                sumSlPts += flipPnL
+            flipExits += 1
+            closedPct := tradePnL / simAvg * 100
+            mfeTotal += 1
+            if mfeTargetHitThisTrade
+                mfeHitCount += 1
+            runMFE := na
+            bestTradePct  := na(bestTradePct)  ? closedPct : math.max(bestTradePct, closedPct)
+            if closedPct > 0 or mfeTargetHitThisTrade
+                posSimTrades += 1
+            worstTradePct := na(worstTradePct) ? closedPct : math.min(worstTradePct, closedPct)
+            if tradePnL >= 0
+                if dir == 1
+                    longW += 1
+                else
+                    shortW += 1
+                sumWinPct += closedPct
+            else
+                sumLossPct += closedPct
+            equity := equity * (1 + tradePnL / simAvg)
+            pendFlipLbl := true
+            pendFlipPct := closedPct
+            pendFlipDir := dir
+            simQty   := 0.0
+            simInPos := false
+        else if isReentry
+            reentries += 1
+
+        dir         := newSignal
+        simAvg      := f_fill(newSignal, close)
+        simQty      := 1.0
+        simOrig     := 1.0
+        simBooks    := 0
+        float entryFee = f_fee(1.0, simAvg)
+        tradePnL    := -entryFee
+        cumPnL      -= entryFee
+        sumCostPts  += entryFee
+        simSL       := f_slInitial(dir, simAvg)
+        runMFE                := 0.0
+        mfeTargetHitThisTrade := false
+        simInPos    := true
+        entryBarIdx := bar_index
+        lastTradeBar := bar_index
+        if dir == 1
+            longT += 1
+        else
+            shortT += 1
+        fEntry := true
+
+        if not wrGateOK
+            wrGateBlockCnt += 1
+        if not annGateOK
+            annGateBlockCnt += 1
+        if not annMfeGateOK
+            annMfeGateBlockCnt += 1
+        if not mfeGateOK
+            mfeGateBlockCnt += 1
+        if not posGateOK
+            posGateBlockCnt += 1
+
+        // ── THREE-WAY SERVER DECISION ──
+        if barstate.isrealtime and entryFiredBar != bar_index
+            if entryAllowed
+                fEntryAlert   := true
+                entryFiredBar := bar_index
+                srvDir        := newSignal
+                if i_govMaxTrades > 0
+                    array.push(govEntries, time)
+            else if flattenAllowed and srvDir != 0 and srvDir != newSignal
+                fFlatAlert    := true
+                flatDir       := srvDir
+                flatPct       := closedPct
+                entryFiredBar := bar_index
+                srvDir        := 0
+                flattenCnt    += 1
+                lastFlatBar   := bar_index
+
+// ═══════════════════════════════════════════════════════════
+//  RESYNC — gates reopened, server believed FLAT, SIM STILL HOLDS
+// ═══════════════════════════════════════════════════════════
+if i_resync and barstate.isrealtime and barstate.isconfirmed and simInPos and entryAllowed and srvDir == 0 and dir != 0 and bar_index > lastFlatBar + i_resyncBars and entryFiredBar != bar_index
+    fEntryAlert   := true
+    entryFiredBar := bar_index
+    srvDir        := dir
+    resyncCnt     += 1
+    if i_govMaxTrades > 0
+        array.push(govEntries, time)
+
+// ═══════════════════════════════════════════════════════════
+//  KILL SWITCH — hysteresis; PAUSES new entries (no close of its own)
+// ═══════════════════════════════════════════════════════════
+float curEquityLive = equity
+if simInPos and simQty > 0 and not na(simAvg) and simAvg > 0
+    curEquityLive := equity * (1 + (tradePnL + (dir == 1 ? simQty * (close - simAvg) : simQty * (simAvg - close))) / simAvg)
+float returnPctLive = (curEquityLive - 10000.0) / 10000.0 * 100
+
+bool killed = wasKilled
+if i_minPnl != 0.0
+    if i_minPnl > 0.0 and not killArmedPos and returnPctLive >= (i_minPnl + i_resumeBuffer) and barstate.isconfirmed
+        killArmedPos := true
+    bool killArmed = i_minPnl < 0.0 or killArmedPos
+    if not wasKilled and killArmed and returnPctLive < i_minPnl and barstate.isconfirmed
+        killed := true
+    else if wasKilled and returnPctLive >= (i_minPnl + i_resumeBuffer) and barstate.isconfirmed
+        killed := false
+wasKilled := killed
+
+// ═══════════════════════════════════════════════════════════
+//  RETURN %
+// ═══════════════════════════════════════════════════════════
+float openPnL = 0.0
+if simInPos and simQty > 0 and not na(simAvg) and simAvg > 0
+    openPnL := dir == 1 ? simQty * (close - simAvg) : simQty * (simAvg - close)
+float curEquity = curEquityLive
+float returnPct = returnPctLive
+
+// ═══════════════════════════════════════════════════════════
+//  WEBHOOK JSON
+// ═══════════════════════════════════════════════════════════
+float dispTP = simInPos and not na(simAvg) ? (dir == 1 ? simAvg * (1 + i_tpStep * (simBooks + 1)) : simAvg * (1 - i_tpStep * (simBooks + 1))) : na
+entryAction = dir == 1 ? "buy" : "sell"
+entryJson = '{"action":"' + entryAction + '","symbol":"' + cdcxPair + '","type":"entry","price":"' + str.tostring(close) + '","leverage":"' + str.tostring(i_lev) + '","margin_currency":"' + i_margin + '","tp_price":"' + str.tostring(dispTP) + '","sl_price":"' + str.tostring(simSL) + '","labeled":"' + (fEntry ? "1" : "0") + '","secret":"' + i_secret + '"}'
+
+closeAction = flatDir == 1 ? "sell" : "buy"
+closeJson = '{"action":"' + closeAction + '","symbol":"' + cdcxPair + '","type":"close","reason":"gate_block","price":"' + str.tostring(close) + '","return_pct":"' + str.tostring(flatPct, "#.##") + '","secret":"' + i_secret + '"}'
+
+if fEntryAlert
+    alert(entryJson, alert.freq_all)
+if fFlatAlert
+    alert(closeJson, alert.freq_all)
+
+// ═══════════════════════════════════════════════════════════
+//  LABELS
+// ═══════════════════════════════════════════════════════════
+if fEntry
+    lbl = dir == 1 ? "▲ LONG (z)" : "▼ SHORT (z)"
+    col = dir == 1 ? color.green : color.red
+    label.new(bar_index, dir == 1 ? low : high, lbl + "\n" + str.tostring(close, "#.########"), color=col, textcolor=color.white, size=size.small, style=dir == 1 ? label.style_label_up : label.style_label_down)
+
+if fMfeHit
+    label.new(bar_index, dir == 1 ? high : low, "🎯 MFE " + str.tostring(mfeThresholdFrac * 100, "#.###") + "%", color=color.new(#ffd600, 0), textcolor=color.black, size=size.tiny, style=dir == 1 ? label.style_label_down : label.style_label_up)
+
+if fFlatAlert
+    label.new(bar_index, flatDir == 1 ? high : low, "🔻 FLATTEN\nserver → flat", color=color.new(#ff9800, 0), textcolor=color.white, size=size.small, style=flatDir == 1 ? label.style_label_down : label.style_label_up)
+
+if barstate.isconfirmed
+    if pendFlat
+        colSL = pendFlatPct >= 0 ? color.green : color.red
+        tagSL = "🪜 LADDER " + (pendFlatPct >= 0 ? "TRAIL-OUT " : "SL ") + str.tostring(pendFlatPct, "#.##") + "%"
+        label.new(bar_index, pendFlatDir == 1 ? high : low, tagSL, color=colSL, textcolor=color.white, size=size.tiny, style=pendFlatDir == 1 ? label.style_label_down : label.style_label_up)
+        pendFlat := false
+    if pendBook
+        label.new(bar_index, pendBookDir == 1 ? high : low, "📦 Book " + str.tostring(pendBookN), color=color.new(#2196f3, 0), textcolor=color.white, size=size.tiny, style=pendBookDir == 1 ? label.style_label_down : label.style_label_up)
+        pendBook := false
+    if pendFlipLbl
+        colF = pendFlipPct >= 0 ? color.green : color.red
+        tagF = (pendFlipSync ? (pendFlipPct >= 0 ? "⟳ RE-SYNC +" : "⟳ RE-SYNC ") : pendFlipPct >= 0 ? "🔁 FLIP TP +" : "🔁 FLIP ") + str.tostring(pendFlipPct, "#.##") + "%"
+        label.new(bar_index, pendFlipDir == 1 ? low : high, tagF, color=colF, textcolor=color.white, size=size.tiny, style=pendFlipDir == 1 ? label.style_label_up : label.style_label_down)
+        pendFlipLbl  := false
+        pendFlipSync := false
+
+// ═══════════════════════════════════════════════════════════
+//  PLOTS
+// ═══════════════════════════════════════════════════════════
+plot(simInPos ? simSL : na, "Ladder SL (sim)", color.new(#ff1744, 0), style=plot.style_stepline)
+plot(simInPos ? dispTP : na, "Next rung (sim)", color.new(#00e676, 0), style=plot.style_stepline)
+bgcolor(simInPos and dir == 1 ? color.new(#00e676, 95) : simInPos and dir == -1 ? color.new(#ff1744, 95) : na)
+// Bands — the strategy core.
+plot(started ? mean  : na, "Mean (μ)", color.new(#9e9e9e, 0))
+plot(started ? upper : na, "+kσ", color.new(#00e676, 30))
+plot(started ? lower : na, "−kσ", color.new(#ff1744, 30))
+plot(z, "z", color=color.new(#2962FF, 0), display=display.status_line, editable=false)
+
+// ═══════════════════════════════════════════════════════════
+//  DASHBOARD — 52 rows declared; visible rows pack from the top with no gaps.
+//  f_cellIf / f_cellBgIf emit only when shown and RETURN the next row cursor.
+// ═══════════════════════════════════════════════════════════
+var table dash = table.new(position.top_right, 2, 52, bgcolor=color.new(#1a1a2e, 0), border_color=color.new(#333333, 0), border_width=1)
+
+f_cellIf(bool show, int r, string lbl, string val, color clr) =>
+    if show
+        table.cell(dash, 0, r, lbl, text_color=#aaaaaa, text_size=size.small, text_halign=text.align_left)
+        table.cell(dash, 1, r, val, text_color=clr,     text_size=size.small, text_halign=text.align_right)
+    show ? r + 1 : r
+
+f_cellBgIf(bool show, int r, string lbl, string val, color txtC, color bgC) =>
+    if show
+        table.cell(dash, 0, r, lbl, text_color=#aaaaaa, text_size=size.small, text_halign=text.align_left)
+        table.cell(dash, 1, r, val, text_color=txtC, text_size=size.small, text_halign=text.align_right, bgcolor=bgC)
+    show ? r + 1 : r
+
+if barstate.islast
+    longWR  = longT > 0 ? longW * 100.0 / longT : 0.0
+    shortWR = shortT > 0 ? shortW * 100.0 / shortT : 0.0
+    curPnlPct = simInPos and simQty > 0 and simAvg > 0 ? (dir == 1 ? (close - simAvg) / simAvg * 100 : (simAvg - close) / simAvg * 100) : 0.0
+    netPnL = cumPnL + openPnL
+    pnlCol = netPnL >= 0 ? #00e676 : #ff1744
+    wrCol  = wrPct >= 60 ? color.new(#00c853, 0) : wrPct >= 50 ? color.new(#ffd600, 0) : color.new(#ff1744, 0)
+    cpCol  = curPnlPct >= 0 ? #00e676 : #ff1744
+    bool subCent = i_subCentGuard and close < i_subCentPx
+
+    // ── z / band readout ──
+    color  zCol  = not na(z) ? (math.abs(z) >= i_k ? (z >= 0 ? #00e676 : #ff1744) : color.white) : #aaaaaa
+    string zStr  = not started ? "⏳ warm-up · " + str.tostring(bar_index + 1) + " / " + str.tostring(len) + " bars" : "z " + str.tostring(z, "#.##") + " · ±" + str.tostring(i_k, "#.#") + "σ · last break " + (lastRawDir == 1 ? "UP" : lastRawDir == -1 ? "DOWN" : "—")
+    float  avgWinBarsL = winCntLong  > 0 ? winBarsLong  / winCntLong  : 0.0
+    float  avgWinBarsS = winCntShort > 0 ? winBarsShort / winCntShort : 0.0
+    int    curBars     = simInPos ? bar_index - entryBarIdx : 0
+    float  avgDirBars  = dir == 1 ? avgWinBarsL : dir == -1 ? avgWinBarsS : 0.0
+    float  curVsAvg    = simInPos and avgDirBars > 0 ? curBars / avgDirBars * 100 : 0.0
+
+    int r = 0
+
+    r := f_cellIf(i_shStrategy, r, "Strategy", "Z-SCORE " + (i_mode == "Breakout" ? "BREAKOUT" : "MEAN-REV") + " · server exits", #5ffae0)
+    r := f_cellIf(i_shPair,     r, "Pair", cdcxPair, #5ffae0)
+
+    // ── OVERALL VERDICT — names EVERY active blocker ──
+    string blk = ""
+    if not started
+        blk := "warm-up"
+    if not syncReady
+        blk := blk + (str.length(blk) == 0 ? "" : " + ") + "waiting for re-sync"
+    if killed
+        blk := blk + (str.length(blk) == 0 ? "" : " + ") + "kill " + str.tostring(returnPct, "#.#") + "%"
+    if govGated
+        blk := blk + (str.length(blk) == 0 ? "" : " + ") + "gov " + str.tostring(govCount) + "/" + str.tostring(i_govMaxTrades)
+    if i_wait > 0 and bar_index <= lastTradeBar + i_wait
+        blk := blk + (str.length(blk) == 0 ? "" : " + ") + "wait " + str.tostring(lastTradeBar + i_wait - bar_index + 1) + "b"
+    if minEntBlocking
+        blk := blk + (str.length(blk) == 0 ? "" : " + ") + "evidence " + str.tostring(simEntries) + "/" + str.tostring(i_minEntries)
+    if wrGateBlocking
+        blk := blk + (str.length(blk) == 0 ? "" : " + ") + "WR " + str.tostring(wrPct, "#.#") + "≤" + str.tostring(beWR, "#.#")
+    if annGateBlocking
+        blk := blk + (str.length(blk) == 0 ? "" : " + ") + "annih " + str.tostring(annihilations) + "/" + str.tostring(i_annMax)
+    if annMfeGateBlocking
+        blk := blk + (str.length(blk) == 0 ? "" : " + ") + "annih-mfe " + str.tostring(annihBeforeMfe) + "/" + str.tostring(i_annMfeMax)
+    if mfeGateBlocking
+        blk := blk + (str.length(blk) == 0 ? "" : " + ") + "mfe " + str.tostring(mfeHitPct, "#.#") + "≤" + str.tostring(i_mfeThreshold, "#.#")
+    if posGateBlocking
+        blk := blk + (str.length(blk) == 0 ? "" : " + ") + "positive " + str.tostring(posGateVal, "#.#") + "<" + str.tostring(i_posThreshold, "#.#")
+    bool   canFlat   = flattenAllowed and srvDir != 0
+    bool   allOpen   = str.length(blk) == 0
+    string verdict   = allOpen ? "✅ CAN TRADE" : ("⛔ " + blk + (canFlat ? " · can flatten" : " · MUTE"))
+    color  verdictBg = allOpen ? color.new(#00c853, 0) : (canFlat ? color.new(#ff9800, 0) : color.new(#b71c1c, 0))
+    r := f_cellBgIf(i_shCanTrade, r, "TRADE?", verdict, color.white, verdictBg)
+    r := f_cellIf(i_shZCfg,     r, "Z cfg", i_mode + " · window " + str.tostring(i_winHrs, "#.##") + "h (" + str.tostring(len) + " bars) · σ clamp " + str.tostring(i_sdFloorPct * 100, "#.##") + "–" + str.tostring(i_sdCeilPct * 100, "#.#") + "% · wait " + str.tostring(i_wait) + (i_reenter ? " · re-entry" : ""), color.white)
+    r := f_cellIf(i_shZNow,     r, "Z · band", zStr, started ? zCol : #ffd600)
+    r := f_cellIf(i_shRawSig,   r, "Raw signals", "buy " + str.tostring(rawBuyCnt) + " / sell " + str.tostring(rawSellCnt), #ffd600)
+    r := f_cellIf(i_shBars,     r, "Trade bars", simInPos ? str.tostring(curBars) + (avgDirBars > 0 ? " · " + str.tostring(curVsAvg, "#") + "% of avg win" : "") : "—", curVsAvg > 200 ? #ff1744 : curVsAvg > 100 ? #ffd600 : color.white)
+    r := f_cellIf(i_shAvgBars,  r, "Avg win bars L / S", str.tostring(avgWinBarsL, "#.#") + " / " + str.tostring(avgWinBarsS, "#.#"), #ffd600)
+    r := f_cellIf(i_shEntries,  r, "Entries (Re)", str.tostring(longT + shortT) + " (" + str.tostring(reentries) + " re)", color.white)
+    // ── MIN-ENTRIES GATE — sits next to the count it reads ──
+    if i_minEntries <= 0
+        r := f_cellIf(i_shMinEnt, r, "Min-Entries Gate", "OFF", #aaaaaa)
+    else if minEntOK
+        r := f_cellIf(i_shMinEnt, r, "Min-Entries Gate", "✅ OPEN · " + str.tostring(simEntries) + "/" + str.tostring(i_minEntries) + " entries", #00e676)
+    else
+        r := f_cellBgIf(i_shMinEnt, r, "Min-Entries Gate", "🔒 BLOCKED · " + str.tostring(simEntries) + "/" + str.tostring(i_minEntries) + " entries", color.white, color.new(#455a64, 0))
+
+    r := f_cellIf(i_shLS,       r, "Long / Short", str.tostring(longT) + " / " + str.tostring(shortT), color.white)
+    r := f_cellBgIf(i_shWR,     r, "Win Rate", str.tostring(wrPct, "#.#") + "%", color.white, wrCol)
+    float posSimPct = closedTrades > 0 ? posSimTrades * 100.0 / closedTrades : 0.0
+    float posSigPct = sigTrades > 0 ? sigPosTrades * 100.0 / sigTrades : 0.0
+    float avgSigRet = sigTrades > 0 ? sigSumRet / sigTrades : 0.0
+    string posTxt = "sim " + str.tostring(posSimPct, "#.#") + "% (" + str.tostring(posSimTrades) + "/" + str.tostring(closedTrades) + ") · signal " + str.tostring(posSigPct, "#.#") + "% (" + str.tostring(sigPosTrades) + "/" + str.tostring(sigTrades) + ", avg " + (avgSigRet >= 0 ? "+" : "") + str.tostring(avgSigRet, "#.##") + "%)"
+    r := f_cellIf(i_shPosRet,   r, "Positive (net>0 or MFE)", posTxt, (i_posBasis == "Sim" ? posSimPct : posSigPct) >= (i_posGate ? i_posThreshold : 50.0) ? #00e676 : #ff9800)
+    r := f_cellIf(i_shLongWR,   r, "Long WR%",  str.tostring(longWR, "#.#") + "%",  longWR >= 50 ? #00e676 : #ff1744)
+    r := f_cellIf(i_shShortWR,  r, "Short WR%", str.tostring(shortWR, "#.#") + "%", shortWR >= 50 ? #00e676 : #ff1744)
+    r := f_cellIf(i_shBooks,    r, "TP Books", str.tostring(tpBooks), #00e676)
+    r := f_cellIf(i_shLosses,   r, "Real Losses", str.tostring(closedTrades - winCount), #ff1744)
+    r := f_cellIf(i_shAnnih,    r, "Annihilations", str.tostring(annihilations) + " (SL, 0 books)", annihilations > 0 ? #ff1744 : #aaaaaa)
+    r := f_cellIf(i_shAnnihMfe, r, "Annih before MFE", str.tostring(annihBeforeMfe) + " / " + str.tostring(annihilations) + " annih", annihBeforeMfe > 0 ? #ff1744 : #00e676)
+    r := f_cellIf(i_shSlExits,  r, "Ladder SL exits", str.tostring(slExits), #ff1744)
+    r := f_cellIf(i_shFlipEx,   r, "Flip / re-sync exits", str.tostring(flipExits) + " (" + str.tostring(simResetCnt) + " re-syncs)", #ffd600)
+    string bwTxt = na(bestTradePct) ? "—" : (bestTradePct >= 0 ? "+" : "") + str.tostring(bestTradePct, "#.##") + "% / " + (worstTradePct >= 0 ? "+" : "") + str.tostring(worstTradePct, "#.##") + "%"
+    r := f_cellIf(i_shBW,       r, "Best / Worst", bwTxt, color.white)
+    string mfeTxt = mfeTotal > 0 ? str.tostring(mfeHitPct, "#.#") + "% (" + str.tostring(mfeHitCount) + "/" + str.tostring(mfeTotal) + " reached ≥" + str.tostring(mfeThresholdFrac * 100, "#.###") + "%)" : "— (≥" + str.tostring(mfeThresholdFrac * 100, "#.###") + "%)"
+    r := f_cellIf(i_shMfeReach, r, "MFE reach", mfeTxt, mfeTotal == 0 ? #aaaaaa : mfeHitPct >= i_mfeThreshold ? #00e676 : #ff9800)
+    r := f_cellIf(i_shTpPts,    r, "Sum TP Pts", "+" + str.tostring(sumTpPts, "#.####"), #00e676)
+    r := f_cellIf(i_shSlPts,    r, "Sum SL Pts", str.tostring(sumSlPts, "#.####"), #ff1744)
+    r := f_cellIf(i_shCost,     r, "Costs (fee·slip·fund)", str.tostring(i_feeBps, "#.#") + "·" + str.tostring(i_slipBps, "#.#") + "·" + str.tostring(i_fundBps, "#.#") + " bps · −" + str.tostring(sumCostPts, "#.####") + " pts", #ff9800)
+    r := f_cellIf(i_shTrail,    r, "Trail Outs / Pts", str.tostring(trailOuts) + " · +" + str.tostring(sumTrailPts, "#.####"), #00bcd4)
+
+    netSign = netPnL >= 0 ? "+" : ""
+    r := f_cellIf(i_shNetPnl, r, "Net P&L", netSign + str.tostring(netPnL, "#.####"), pnlCol)
+
+    // ── NET P&L % — arithmetic sum of all closed exits. NOT compounded, and
+    //    deliberately NOT suppressed by the sub-cent guard (see header).
+    string pctSign = netPctSum >= 0 ? "+" : ""
+    string openTag = (simInPos and simQty > 0) ? "  (" + (curPnlPct >= 0 ? "+" : "") + str.tostring(curPnlPct, "#.##") + "% open)" : ""
+    color  pctCol  = netPctSum >= 0 ? #00e676 : #ff1744
+    r := f_cellBgIf(i_shNetPct, r, "Net P&L % (after costs)", pctSign + str.tostring(netPctSum, "#.##") + "%" + openTag, pctCol, netPctSum >= 0 ? color.new(#00c853, 80) : color.new(#ff1744, 80))
+
+    r := f_cellIf(i_shLadder,  r, "Ladder mirror", str.tostring(i_slPct * 100, "#.#") + "% SL · " + str.tostring(i_tpStep * 100, "#.#") + "% rung · " + str.tostring(i_book * 100, "#") + "%×" + str.tostring(i_maxBook), color.white)
+    r := f_cellIf(i_shBooksDn, r, "Books Done", str.tostring(simBooks) + " / " + str.tostring(i_maxBook), color.white)
+
+    // ── ENTRY GOV ──
+    if i_govMaxTrades == 0
+        r := f_cellIf(i_shGov, r, "Entry Gov", "OFF", #aaaaaa)
+    else if govGated
+        r := f_cellBgIf(i_shGov, r, "Entry Gov", "⛔ " + str.tostring(govCount) + " / " + str.tostring(i_govMaxTrades) + " in " + str.tostring(i_govWindowHrs, "#.#") + "h", color.white, color.new(#ff0000, 0))
+    else
+        r := f_cellIf(i_shGov, r, "Entry Gov", str.tostring(govCount) + " / " + str.tostring(i_govMaxTrades) + " in " + str.tostring(i_govWindowHrs, "#.#") + "h", govCount >= i_govMaxTrades - 1 ? #ff9800 : color.white)
+
+    r := f_cellIf(i_shSigPos, r, "Signal Pos", simInPos ? (dir == 1 ? "LONG sig" : "SHORT sig") : (dir == 0 ? "—" : "FLAT (await opp. break)"), simInPos ? (dir == 1 ? #00e676 : #ff1744) : #aaaaaa)
+    r := f_cellIf(i_shCurPnl, r, "Cur P&L%", simInPos ? str.tostring(curPnlPct, "#.##") + "%" : "—", cpCol)
+
+    // ── STATE ──
+    if not syncReady
+        r := f_cellBgIf(i_shState, r, "State", "⏳ WAITING FOR RE-SYNC (webhooks muted)", color.black, color.new(#ffd600, 0))
+    else if killed
+        r := f_cellBgIf(i_shState, r, "State", "☠️ KILLED (entries paused)", color.white, color.new(#ff0000, 0))
+    else if govGated
+        r := f_cellBgIf(i_shState, r, "State", "⛔ GOV GATED (no entries)", color.white, color.new(#9c27b0, 0))
+    else if not started
+        r := f_cellBgIf(i_shState, r, "State", "⏳ WARMUP", color.black, color.new(#ffd600, 0))
+    else if minEntBlocking
+        r := f_cellBgIf(i_shState, r, "State", "🔒 NO EVIDENCE (" + str.tostring(simEntries) + "/" + str.tostring(i_minEntries) + " entries)", color.white, color.new(#455a64, 0))
+    else if wrGateBlocking
+        r := f_cellBgIf(i_shState, r, "State", "🚫 WR-GATED (alerts off)", color.white, color.new(#ff9800, 0))
+    else if annGateBlocking
+        r := f_cellBgIf(i_shState, r, "State", "💀 ANNIH-GATED (alerts off)", color.white, color.new(#b71c1c, 0))
+    else if annMfeGateBlocking
+        r := f_cellBgIf(i_shState, r, "State", "☢️ ANNIH-MFE-GATED (alerts off)", color.white, color.new(#b71c1c, 0))
+    else if mfeGateBlocking
+        r := f_cellBgIf(i_shState, r, "State", "📉 MFE-GATED (alerts off)", color.white, color.new(#ff9800, 0))
+    else if posGateBlocking
+        r := f_cellBgIf(i_shState, r, "State", "➖ POSITIVE-GATED (alerts off)", color.white, color.new(#ff9800, 0))
+    else
+        r := f_cellIf(i_shState, r, "State", not simInPos ? (dir == 0 ? "WARM-UP" : "FLAT") : dir == 1 ? "LONG" : "SHORT", not simInPos ? #aaaaaa : dir == 1 ? #00e676 : #ff1744)
+
+    // ── EQUITY / RETURN % (compounded; sub-cent guarded) ──
+    if subCent
+        r := f_cellIf(i_shEquity, r, "Equity ($)", "n/a (sub-cent)", #ff9800)
+        r := f_cellIf(i_shReturn, r, "Return %",   "n/a (sub-cent)", #ff9800)
+    else
+        eqCol = curEquity >= 10000.0 ? #00e676 : #ff1744
+        r := f_cellBgIf(i_shEquity, r, "Equity ($)", "$" + str.tostring(curEquity, "#.##"), eqCol, curEquity >= 10000.0 ? color.new(#00c853, 80) : color.new(#ff1744, 80))
+        retSign = returnPct >= 0 ? "+" : ""
+        retCol  = returnPct >= 0 ? #00e676 : #ff1744
+        r := f_cellBgIf(i_shReturn, r, "Return %", retSign + str.tostring(returnPct, "#.##") + "%", retCol, returnPct >= 0 ? color.new(#00c853, 80) : color.new(#ff1744, 80))
+
+    float curMonthStart = not na(prevMonthEquity) ? prevMonthEquity : 10000.0
+    if curMonthStart != 0
+        array.push(monthlyReturns, (curEquity - curMonthStart) / curMonthStart * 100)
+    int   moCount  = array.size(monthlyReturns)
+    float avgMoRet = moCount > 0 ? array.avg(monthlyReturns) : 0.0
+    string avgMoSign = avgMoRet >= 0 ? "+" : ""
+    color  avgMoCol  = avgMoRet >= 0 ? #00e676 : #ff1744
+    if subCent
+        r := f_cellIf(i_shAvgMo, r, "Avg Mo Ret%", "n/a (sub-cent)", #ff9800)
+    else
+        r := f_cellBgIf(i_shAvgMo, r, "Avg Mo Ret%", avgMoSign + str.tostring(avgMoRet, "#.##") + "% (" + str.tostring(moCount) + "mo)", avgMoCol, avgMoRet >= 0 ? color.new(#00c853, 80) : color.new(#ff1744, 80))
+    if moCount > 0
+        array.pop(monthlyReturns)
+
+    minPnlStr = i_minPnl == 0.0 ? "OFF" : str.tostring(i_minPnl, "#.#") + "%" + (i_minPnl > 0.0 ? (killArmedPos ? " (armed)" : " (arming…)") : "")
+    r := f_cellIf(i_shKill,   r, "Kill @", minPnlStr, i_minPnl == 0.0 ? #aaaaaa : (killed ? #ff1744 : #ff9800))
+    resumeStr = i_minPnl == 0.0 ? "OFF" : str.tostring(i_minPnl + i_resumeBuffer, "#.#") + "%"
+    r := f_cellIf(i_shResume, r, "Resume @", resumeStr, i_minPnl == 0.0 ? #aaaaaa : (killed ? #ff9800 : #00e676))
+
+    r := f_cellIf(i_shAvgWin,  r, "Avg Win%",  "+" + str.tostring(avgWinPct, "#.##") + "%", #00e676)
+    r := f_cellIf(i_shAvgLoss, r, "Avg Loss%", str.tostring(-avgLossPct, "#.##") + "%", #ff1744)
+    beCol = (closedTrades > 0 and wrPct > beWR) ? color.new(#00c853, 0) : color.new(#ff1744, 0)
+    r := f_cellBgIf(i_shBeWR, r, "Breakeven WR", str.tostring(beWR, "#.#") + "% (need >)", color.white, beCol)
+
+    // ── WR GATE ──
+    if not i_wrGate
+        r := f_cellIf(i_shWrGateR, r, "WR Gate", "OFF", #aaaaaa)
+    else if not wrDataOK
+        r := f_cellIf(i_shWrGateR, r, "WR Gate", "⏳ " + str.tostring(closedTrades) + "/" + str.tostring(math.max(i_wrGateMin, 1)) + " trades · OPEN", #ffd600)
+    else if wrGateOK
+        r := f_cellIf(i_shWrGateR, r, "WR Gate", "✅ OPEN · shut ≤" + str.tostring(beWR, "#.#") + "% · blk " + str.tostring(wrGateBlockCnt), #00e676)
+    else
+        r := f_cellBgIf(i_shWrGateR, r, "WR Gate", "🚫 BLOCKED · reopen >" + str.tostring(wrReopen, "#.#") + "% · blk " + str.tostring(wrGateBlockCnt), color.white, color.new(#ff9800, 0))
+
+    // ── ANNIH GATE ──
+    if not i_annGate
+        r := f_cellIf(i_shAnnGateR, r, "Annih Gate", "OFF", #aaaaaa)
+    else if annGateOK
+        r := f_cellIf(i_shAnnGateR, r, "Annih Gate", "✅ OPEN · " + str.tostring(annihilations) + "/" + str.tostring(i_annMax) + " · blk " + str.tostring(annGateBlockCnt), #00e676)
+    else
+        r := f_cellBgIf(i_shAnnGateR, r, "Annih Gate", "💀 BLOCKED · " + str.tostring(annihilations) + "/" + str.tostring(i_annMax) + " · blk " + str.tostring(annGateBlockCnt), color.white, color.new(#b71c1c, 0))
+
+    // ── ANNIH-BEFORE-MFE GATE ──
+    if not i_annMfeGate
+        r := f_cellIf(i_shAnnMfeGateR, r, "Annih-MFE Gate", "OFF", #aaaaaa)
+    else if annMfeGateOK
+        r := f_cellIf(i_shAnnMfeGateR, r, "Annih-MFE Gate", "✅ OPEN · " + str.tostring(annihBeforeMfe) + "/" + str.tostring(i_annMfeMax) + " · blk " + str.tostring(annMfeGateBlockCnt), #00e676)
+    else
+        r := f_cellBgIf(i_shAnnMfeGateR, r, "Annih-MFE Gate", "☢️ BLOCKED · " + str.tostring(annihBeforeMfe) + "/" + str.tostring(i_annMfeMax) + " · blk " + str.tostring(annMfeGateBlockCnt), color.white, color.new(#b71c1c, 0))
+
+    // ── MFE GATE ──
+    if not i_mfeGate
+        r := f_cellIf(i_shMfeGate, r, "MFE Gate", "OFF", #aaaaaa)
+    else if not mfeDataOK
+        r := f_cellIf(i_shMfeGate, r, "MFE Gate", "⏳ " + str.tostring(mfeTotal) + "/" + str.tostring(i_mfeGateMin) + " trades · OPEN", #ffd600)
+    else if mfeGateOK
+        r := f_cellIf(i_shMfeGate, r, "MFE Gate", "✅ OPEN · shut <" + str.tostring(i_mfeThreshold, "#.#") + "% · blk " + str.tostring(mfeGateBlockCnt), #00e676)
+    else
+        r := f_cellBgIf(i_shMfeGate, r, "MFE Gate", "📉 BLOCKED · reopen ≥" + str.tostring(i_mfeThreshold + i_mfeResumeBuffer, "#.#") + "% · blk " + str.tostring(mfeGateBlockCnt), color.white, color.new(#ff9800, 0))
+
+    // ── POSITIVE GATE ──
+    if not i_posGate
+        r := f_cellIf(i_shPosGate, r, "Positive Gate", "OFF", #aaaaaa)
+    else if not posDataOK
+        r := f_cellIf(i_shPosGate, r, "Positive Gate", "⏳ " + str.tostring(posGateN) + "/" + str.tostring(i_posGateMin) + " trades · OPEN", #ffd600)
+    else if posGateOK
+        r := f_cellIf(i_shPosGate, r, "Positive Gate", "✅ OPEN · " + i_posBasis + " " + str.tostring(posGateVal, "#.#") + "% · shut <" + str.tostring(i_posThreshold, "#.#") + "% · blk " + str.tostring(posGateBlockCnt), #00e676)
+    else
+        r := f_cellBgIf(i_shPosGate, r, "Positive Gate", "➖ BLOCKED · " + i_posBasis + " " + str.tostring(posGateVal, "#.#") + "% · reopen ≥" + str.tostring(i_posThreshold + i_posResume, "#.#") + "% · blk " + str.tostring(posGateBlockCnt), color.white, color.new(#ff9800, 0))
+
+    // ── SERVER SYNC ──
+    string srvTxt = srvDir == 0 ? "FLAT" : srvDir == 1 ? "LONG" : "SHORT"
+    string simTxt = not simInPos ? "FLAT" : dir == 1 ? "LONG" : "SHORT"
+    string nextRs = str.format_time(bucketStart + simResetMs, "HH:mm", "Asia/Kolkata")
+    string rsTxt  = simResetMs == 0 ? "re-sync OFF" : not syncReady ? "⏳ muted until " + nextRs + " IST" : "re-sync " + str.tostring(i_simResetHrs, "#.#") + "h · next " + nextRs + " IST"
+    r := f_cellIf(i_shSrvPos, r, "Srv Pos", "belief " + srvTxt + " · sim " + simTxt + " · " + rsTxt, not syncReady ? #ffd600 : simResetMs == 0 ? #ff9800 : #00bcd4)
+
+    string syncMode = not i_flatten ? "OFF · silent block" : ("FLATTEN" + (i_resync ? "+RESYNC" : "") + (i_govFlatten ? "+GOV" : ""))
+    r := f_cellIf(i_shSync, r, "Sync", syncMode + " · fl " + str.tostring(flattenCnt) + " / rs " + str.tostring(resyncCnt), i_flatten ? #00bcd4 : #aaaaaa)

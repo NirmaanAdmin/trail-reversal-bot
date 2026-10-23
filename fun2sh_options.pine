@@ -1,0 +1,494 @@
+//@version=5
+indicator("fun2sh Options (Kite)", overlay=true, max_labels_count=500)
+
+// ═══════════════════════════════════════════════════════════
+//  ENTRY-ONLY edition — adapted for the Kite OPTIONS server.
+//
+//  Pine fires ONLY entry signals. The server owns the entire trade
+//  lifecycle after fill — SL, TP, partial books, trailing, the exit.
+//  Pine sends NO book / SL / reverse / kill / resume webhooks.
+//
+//  PAYLOAD (sent to /webhook on Kite options server):
+//    {
+//      "secret":  "<WEBHOOK_SECRET>",
+//      "symbol":  "TATASTEEL",      // auto from syminfo.ticker on NSE charts
+//      "action":  "buy" | "sell",   // buy → server buys CE, sell → server buys PE
+//      "type":    "entry",          // always "entry" — server rejects anything else
+//      "price":   217.91            // spot at signal close
+//    }
+//
+//  BEHAVIOUR:
+//   • Full strategy simulation drives labels + dashboard (display only).
+//   • An ENTRY alert fires once per flip, at bar close, deduped per bar.
+//   • Server reads opposite-side entry on a tracked symbol as a FLIP
+//     (close current CE/PE → open opposite type on same symbol).
+//   • Server reads same-side entry as a no-op (already in position).
+//   • Detection is BAR-CLOSE (i_tick=false) — wick can't commit a flip.
+//   • Governor: entry fires only if FEWER than i_govMaxTrades entries fired
+//     in the trailing i_govWindowHrs. Defaults 3 entries / 24h.
+//   • Kill switch (default OFF) only PAUSES new entries on drawdown; sends
+//     no close (server owns the exit).
+// ═══════════════════════════════════════════════════════════
+
+// ═══════════════════════════════════════════════════════════
+//  INPUTS
+// ═══════════════════════════════════════════════════════════
+i_dir     = input.string("Short", "Start Direction", options=["Long", "Short"])
+i_tp      = input.float(4.0, "TP %", step=0.1) / 100
+i_sl      = input.float(3.0, "SL %", step=0.1) / 100
+i_book    = input.float(33.0, "Booking % of current qty", step=1) / 100
+i_maxBook = input.int(2, "Max Partial Bookings before pure trail", minval=0, maxval=2)
+i_wait    = input.int(0, "Wait Bars Between Trades", minval=0, tooltip="Cooldown bars after a flip before the reversed entry fires. 0 = enter at next bar close.")
+i_tick    = input.bool(false, "Intrabar sim detection (display only)", tooltip="ENTRY-ONLY: keep this OFF. Server owns fast intrabar exits.")
+i_govMaxTrades = input.int(3, "Governor: Max Entries per Window (0 = off)", minval=0, tooltip="Entry fires only if FEWER than this many fired within the rolling window. Default 3.")
+i_govWindowHrs = input.float(24.0, "Governor: Window (hours)", minval=0.1, step=0.5, tooltip="Rolling wall-clock window. Default 24h.")
+i_minPnl  = input.float(0.0, "Min Net P&L % (kill switch, 0=off)", step=0.5, tooltip="If Return % drops below this, PAUSES new entries (server still owns exit).")
+i_resumeBuffer = input.float(2.0, "Resume Buffer %", step=0.5, tooltip="After kill, resume only when Return % crosses ABOVE (Min P&L + buffer).")
+i_secret  = input.string("", "Webhook Secret", tooltip="Must match WEBHOOK_SECRET set on the Kite options server.")
+
+// Symbol override — leave blank to auto-derive from syminfo.ticker (recommended).
+// On NSE charts (e.g. NSE:TATASTEEL), syminfo.ticker = "TATASTEEL" which matches
+// Kite's instrument.name field for stock options. For indices use the chart's
+// index ticker (NSE: NIFTY → "NIFTY", BANKNIFTY → "BANKNIFTY", etc.).
+i_symOverride = input.string("", "Underlying Override", tooltip="Leave blank to auto-derive from syminfo.ticker. Override only if the chart ticker doesn't match Kite's instrument.name.")
+
+// ═══════════════════════════════════════════════════════════
+//  STATE — varip
+// ═══════════════════════════════════════════════════════════
+varip float qty      = 0.0
+varip float tp       = na
+varip float sl       = na
+varip int   books    = 0
+varip int   dir      = 0
+varip float ePx      = na
+varip bool  rev      = false
+varip float lastHitTP = na
+varip float origQty  = 1.0
+varip int   slBar    = 0
+varip bool  serverInPos = false
+
+// per-bar alert latch
+varip int   entryFiredBar = -1
+
+// rolling governor: wall-clock (ms) timestamps of fired entries
+varip array<int> govEntries = array.new_int(0)
+
+varip float cumPnL   = 0.0
+varip float tradePnL = 0.0
+varip float sumTpPts = 0.0
+varip float sumSlPts = 0.0
+varip int   slCount  = 0
+varip int   tpBooks  = 0
+varip int   longT    = 0
+varip int   shortT   = 0
+varip int   longW    = 0
+varip int   shortW   = 0
+varip float equity   = 10000.0
+varip bool  wasKilled = false
+
+varip float sumWinPct    = 0.0
+varip int   winCount     = 0
+varip float sumLossPct   = 0.0
+varip int   lossCount    = 0
+varip float bestWinPct   = na
+varip float worstLossPct = na
+
+var array<float> monthlyReturns = array.new_float(0)
+var float prevMonthEquity       = na
+var int   prevMonth             = na
+
+bool  fEntry      = false
+bool  fEntryAlert = false
+bool  fBook       = false
+float bookPct     = 0.0
+varip int    savedDir   = 0
+varip float  slPct      = 0.0
+varip float  slClosePct = 0.0
+
+varip bool trailShifted = false
+if barstate.isnew
+    trailShifted := false
+
+varip bool  pendSL      = false
+varip float pendSLpct   = 0.0
+varip int   pendSLdir   = 0
+varip bool  pendBook    = false
+varip int   pendBookN   = 0
+varip int   pendBookDir = 0
+
+bool  riskTick = i_tick or barstate.isconfirmed
+float effHi    = barstate.isconfirmed ? high : close
+float effLo    = barstate.isconfirmed ? low  : close
+
+// ═══════════════════════════════════════════════════════════
+//  GOVERNOR — prune entries older than the window, compute gate.
+// ═══════════════════════════════════════════════════════════
+int govWindowMs = int(i_govWindowHrs * 60.0 * 60.0 * 1000.0)
+int govCutoff   = time - govWindowMs
+if i_govMaxTrades > 0
+    bool keepPruning = true
+    while keepPruning
+        if array.size(govEntries) > 0
+            if array.get(govEntries, 0) <= govCutoff
+                array.shift(govEntries)
+            else
+                keepPruning := false
+        else
+            keepPruning := false
+bool govGated = i_govMaxTrades > 0 and array.size(govEntries) >= i_govMaxTrades
+
+// ═══════════════════════════════════════════════════════════
+//  SYMBOL — for Kite options server
+//  syminfo.ticker on NSE:TATASTEEL → "TATASTEEL". Matches Kite's
+//  instrument.name field directly. No mangling needed.
+// ═══════════════════════════════════════════════════════════
+f_symbol() =>
+    raw = syminfo.ticker
+    // Strip any -EQ suffix that some NSE tickers carry
+    clean = str.contains(raw, "-EQ") ? str.replace(raw, "-EQ", "") : raw
+    clean
+autoSym       = f_symbol()
+effectiveSym  = i_symOverride == "" ? autoSym : i_symOverride
+
+// ═══════════════════════════════════════════════════════════
+//  FIRST BAR
+// ═══════════════════════════════════════════════════════════
+if barstate.isfirst
+    ePx      := close
+    qty      := 1.0
+    origQty  := 1.0
+    books    := 0
+    tradePnL := 0.0
+    dir      := i_dir == "Long" ? 1 : -1
+    tp       := dir == 1 ? close * (1 + i_tp) : close * (1 - i_tp)
+    sl       := dir == 1 ? close * (1 - i_sl) : close * (1 + i_sl)
+    lastHitTP := na
+    equity   := 10000.0
+    prevMonthEquity := 10000.0
+    prevMonth       := month
+    if dir == 1
+        longT += 1
+    else
+        shortT += 1
+
+if not barstate.isfirst and not na(prevMonth) and month != prevMonth
+    float snapEquity = equity
+    if qty > 0
+        snapEquity := equity * (1 + (dir == 1 ? (close[1] - ePx) / ePx : (ePx - close[1]) / ePx))
+    if not na(prevMonthEquity) and prevMonthEquity != 0
+        float moRet = (snapEquity - prevMonthEquity) / prevMonthEquity * 100
+        array.push(monthlyReturns, moRet)
+    prevMonthEquity := snapEquity
+    prevMonth       := month
+
+// ═══════════════════════════════════════════════════════════
+//  REVERSED ENTRY — BAR CLOSE ONLY, honoring Wait Bars.
+//  The only place an entry webhook fires. Every flip fires an entry;
+//  the server dedups/flips on its side.
+// ═══════════════════════════════════════════════════════════
+if rev and not barstate.isfirst and barstate.isconfirmed and bar_index > slBar + i_wait
+    rev      := false
+    ePx      := close
+    qty      := 1.0
+    origQty  := 1.0
+    books    := 0
+    tradePnL := 0.0
+    lastHitTP := na
+    tp       := dir == 1 ? close * (1 + i_tp) : close * (1 - i_tp)
+    sl       := dir == 1 ? close * (1 - i_sl) : close * (1 + i_sl)
+    if dir == 1
+        longT += 1
+    else
+        shortT += 1
+    fEntry := true
+    if barstate.isrealtime and not govGated and not wasKilled and entryFiredBar != bar_index
+        fEntryAlert   := true
+        serverInPos   := true
+        entryFiredBar := bar_index
+        if i_govMaxTrades > 0
+            array.push(govEntries, time)
+
+// ═══════════════════════════════════════════════════════════
+//  STRATEGY LOGIC — SIM ONLY (drives dashboard + labels)
+// ═══════════════════════════════════════════════════════════
+
+// ─── LONG ───────────────────────────────
+if dir == 1 and qty > 0 and not rev and not barstate.isfirst and riskTick
+    while effHi >= tp and qty > 0
+        float prevTP = tp
+        if books < i_maxBook
+            float cq    = math.min(origQty * i_book, qty)
+            float bkPnL = cq * (prevTP - ePx)
+            cumPnL     += bkPnL
+            tradePnL   += bkPnL
+            sumTpPts   += bkPnL
+            qty        -= cq
+            books      += 1
+            tpBooks    += 1
+            tp := prevTP * (1 + i_tp)
+            sl := prevTP * (1 - i_sl)
+            lastHitTP := prevTP
+            fBook   := true
+            bookPct := i_book * 100
+            pendBook    := true
+            pendBookN   := books
+            pendBookDir := dir
+        else
+            sl := lastHitTP
+            lastHitTP := prevTP
+            tp := prevTP * (1 + i_tp)
+            trailShifted := true
+
+    if effLo <= sl and qty > 0 and not trailShifted
+        float slPnL = qty * (sl - ePx)
+        cumPnL     += slPnL
+        tradePnL   += slPnL
+        sumSlPts   += slPnL
+        slCount    += 1
+        savedDir   := dir
+        slPct      := (sl - ePx) / ePx * 100
+        slClosePct := tradePnL / ePx * 100
+        if slClosePct >= 0
+            sumWinPct  += slClosePct
+            winCount   += 1
+            bestWinPct := na(bestWinPct) ? slClosePct : math.max(bestWinPct, slClosePct)
+        else
+            sumLossPct   += slClosePct
+            lossCount    += 1
+            worstLossPct := na(worstLossPct) ? slClosePct : math.min(worstLossPct, slClosePct)
+        if tradePnL >= 0
+            longW += 1
+        equity := equity * (1 + tradePnL / ePx)
+        pendSL    := true
+        pendSLpct := slPct
+        pendSLdir := savedDir
+        qty   := 0.0
+        dir   := -1
+        rev   := true
+        slBar := bar_index
+        serverInPos := false
+
+// ─── SHORT ──────────────────────────────
+if dir == -1 and qty > 0 and not rev and not barstate.isfirst and riskTick
+    while effLo <= tp and qty > 0
+        float prevTP = tp
+        if books < i_maxBook
+            float cq    = math.min(origQty * i_book, qty)
+            float bkPnL = cq * (ePx - prevTP)
+            cumPnL     += bkPnL
+            tradePnL   += bkPnL
+            sumTpPts   += bkPnL
+            qty        -= cq
+            books      += 1
+            tpBooks    += 1
+            tp := prevTP * (1 - i_tp)
+            sl := prevTP * (1 + i_sl)
+            lastHitTP := prevTP
+            fBook   := true
+            bookPct := i_book * 100
+            pendBook    := true
+            pendBookN   := books
+            pendBookDir := dir
+        else
+            sl := lastHitTP
+            lastHitTP := prevTP
+            tp := prevTP * (1 - i_tp)
+            trailShifted := true
+
+    if effHi >= sl and qty > 0 and not trailShifted
+        float slPnL = qty * (ePx - sl)
+        cumPnL     += slPnL
+        tradePnL   += slPnL
+        sumSlPts   += slPnL
+        slCount    += 1
+        savedDir   := dir
+        slPct      := (ePx - sl) / ePx * 100
+        slClosePct := tradePnL / ePx * 100
+        if slClosePct >= 0
+            sumWinPct  += slClosePct
+            winCount   += 1
+            bestWinPct := na(bestWinPct) ? slClosePct : math.max(bestWinPct, slClosePct)
+        else
+            sumLossPct   += slClosePct
+            lossCount    += 1
+            worstLossPct := na(worstLossPct) ? slClosePct : math.min(worstLossPct, slClosePct)
+        if tradePnL >= 0
+            shortW += 1
+        equity := equity * (1 + tradePnL / ePx)
+        pendSL    := true
+        pendSLpct := slPct
+        pendSLdir := savedDir
+        qty   := 0.0
+        dir   := 1
+        rev   := true
+        slBar := bar_index
+        serverInPos := false
+
+// ═══════════════════════════════════════════════════════════
+//  KILL SWITCH — pauses new entries only (server owns exit).
+// ═══════════════════════════════════════════════════════════
+float curEquityLive = equity
+if qty > 0 and not na(ePx) and ePx > 0
+    curEquityLive := equity * (1 + (dir == 1 ? (close - ePx) / ePx : (ePx - close) / ePx))
+float returnPctLive = (curEquityLive - 10000.0) / 10000.0 * 100
+
+bool killed = wasKilled
+if i_minPnl != 0.0
+    if not wasKilled and returnPctLive < i_minPnl and riskTick
+        killed := true
+    else if wasKilled and returnPctLive >= (i_minPnl + i_resumeBuffer) and barstate.isconfirmed
+        killed := false
+wasKilled := killed
+
+// ═══════════════════════════════════════════════════════════
+//  RETURN %
+// ═══════════════════════════════════════════════════════════
+float openPnL = 0.0
+if qty > 0 and not na(ePx) and ePx > 0
+    openPnL := dir == 1 ? qty * (close - ePx) : qty * (ePx - close)
+float curEquity = curEquityLive
+float returnPct = returnPctLive
+
+// ═══════════════════════════════════════════════════════════
+//  WEBHOOK JSON — ENTRY ONLY
+//  Kite options server expects: secret / symbol / action / type / price.
+// ═══════════════════════════════════════════════════════════
+entryAction = dir == 1 ? "buy" : "sell"
+entryJson = '{"action":"' + entryAction + '","symbol":"' + effectiveSym + '","type":"entry","price":"' + str.tostring(close) + '","secret":"' + i_secret + '"}'
+
+// ═══════════════════════════════════════════════════════════
+//  ALERTS — ONE entry per flip, bar-close, deduped.
+// ═══════════════════════════════════════════════════════════
+if fEntryAlert
+    alert(entryJson, alert.freq_all)
+
+// ═══════════════════════════════════════════════════════════
+//  LABELS
+// ═══════════════════════════════════════════════════════════
+if fEntry
+    lbl = dir == 1 ? "▲ LONG-CE" : "▼ LONG-PE"
+    col = dir == 1 ? color.green : color.red
+    label.new(bar_index, dir == 1 ? low : high, lbl + "\n" + str.tostring(close, "#.########"), color=col, textcolor=color.white, size=size.small, style=dir == 1 ? label.style_label_up : label.style_label_down)
+
+if barstate.isconfirmed
+    if pendSL
+        colSL = pendSLpct >= 0 ? color.green : color.red
+        tagSL = (pendSLpct >= 0 ? "TP" : "SL") + " " + str.tostring(pendSLpct, "#.##") + "%"
+        label.new(bar_index, pendSLdir == 1 ? high : low, tagSL, color=colSL, textcolor=color.white, size=size.tiny, style=pendSLdir == 1 ? label.style_label_down : label.style_label_up)
+        pendSL := false
+    if pendBook and not pendSL
+        label.new(bar_index, pendBookDir == 1 ? high : low, "📦 Book " + str.tostring(pendBookN), color=color.new(#2196f3, 0), textcolor=color.white, size=size.tiny, style=pendBookDir == 1 ? label.style_label_down : label.style_label_up)
+    pendBook := false
+
+// ═══════════════════════════════════════════════════════════
+//  PLOTS
+// ═══════════════════════════════════════════════════════════
+plot(qty > 0 ? tp : na, "TP", color.new(#00e676, 0), style=plot.style_stepline)
+plot(qty > 0 ? sl : na, "SL", color.new(#ff1744, 0), style=plot.style_stepline)
+bgcolor(dir == 1 ? color.new(#00e676, 95) : color.new(#ff1744, 95))
+
+// ═══════════════════════════════════════════════════════════
+//  DASHBOARD
+// ═══════════════════════════════════════════════════════════
+var table dash = table.new(position.top_right, 2, 28, bgcolor=color.new(#1a1a2e, 0), border_color=color.new(#333333, 0), border_width=1)
+
+f_cell(int r, string lbl, string val, color clr) =>
+    table.cell(dash, 0, r, lbl, text_color=#aaaaaa, text_size=size.small, text_halign=text.align_left)
+    table.cell(dash, 1, r, val, text_color=clr,     text_size=size.small, text_halign=text.align_right)
+
+if barstate.islast
+    wr      = slCount > 0 ? (longW + shortW) * 100.0 / slCount : 0.0
+    longWR  = longT > 0 ? longW * 100.0 / longT : 0.0
+    shortWR = shortT > 0 ? shortW * 100.0 / shortT : 0.0
+    curPnlPct = qty > 0 and ePx > 0 ? (dir == 1 ? (close - ePx) / ePx * 100 : (ePx - close) / ePx * 100) : 0.0
+    netPnL = cumPnL + openPnL
+    pnlCol = netPnL >= 0 ? #00e676 : #ff1744
+    avgWinPct  = winCount  > 0 ? sumWinPct  / winCount  : 0.0
+    avgLossPct = lossCount > 0 ? sumLossPct / lossCount : 0.0
+    avgLossMag = math.abs(avgLossPct)
+    breakevenWr = (avgWinPct + avgLossMag) > 0 ? avgLossMag / (avgWinPct + avgLossMag) * 100.0 : na
+    wrCol  = (not na(breakevenWr)) and wr >= breakevenWr ? color.new(#00c853, 0) : color.new(#ff1744, 0)
+    cpCol  = curPnlPct >= 0 ? #00e676 : #ff1744
+
+    int govCount = array.size(govEntries)
+
+    f_cell(0, "Strategy", "ENTRY-ONLY · server exits", #5ffae0)
+    f_cell(1, "Underlying", effectiveSym, #5ffae0)
+    f_cell(2, "Start Dir", i_dir, color.white)
+    f_cell(3, "Total Trades", str.tostring(slCount), color.white)
+    f_cell(4, "Long / Short", str.tostring(longT) + " / " + str.tostring(shortT), color.white)
+
+    table.cell(dash, 0, 5, "Win Rate", text_color=#aaaaaa, text_size=size.small, text_halign=text.align_left)
+    table.cell(dash, 1, 5, str.tostring(wr, "#.#") + "%", text_color=color.white, text_size=size.small, text_halign=text.align_right, bgcolor=wrCol)
+
+    f_cell(6, "Long(CE) WR%", str.tostring(longWR, "#.#") + "%", longWR >= 50 ? #00e676 : #ff1744)
+    f_cell(7, "Short(PE) WR%", str.tostring(shortWR, "#.#") + "%", shortWR >= 50 ? #00e676 : #ff1744)
+    f_cell(8, "TP Books", str.tostring(tpBooks), #00e676)
+    f_cell(9, "Real Losses", str.tostring(lossCount), #ff1744)
+    f_cell(10, "Sum TP Pts", "+" + str.tostring(sumTpPts, "#.##"), #00e676)
+    f_cell(11, "Sum SL Pts", str.tostring(sumSlPts, "#.##"), #ff1744)
+
+    netSign = netPnL >= 0 ? "+" : ""
+    f_cell(12, "Net P&L (spot sim)", netSign + str.tostring(netPnL, "#.##"), pnlCol)
+
+    f_cell(13, "TP% / SL%", str.tostring(i_tp * 100, "#.#") + "% / " + str.tostring(i_sl * 100, "#.#") + "%", color.white)
+    f_cell(14, "Max Books", str.tostring(i_maxBook), color.white)
+    f_cell(15, "Books Done", str.tostring(books) + " / " + str.tostring(i_maxBook), color.white)
+    f_cell(16, "Wait Bars", str.tostring(i_wait), color.white)
+
+    if i_govMaxTrades == 0
+        f_cell(17, "Entry Gov", "OFF", #aaaaaa)
+    else if govGated
+        table.cell(dash, 0, 17, "Entry Gov", text_color=#aaaaaa, text_size=size.small, text_halign=text.align_left)
+        table.cell(dash, 1, 17, "⛔ " + str.tostring(govCount) + " / " + str.tostring(i_govMaxTrades) + " in " + str.tostring(i_govWindowHrs, "#.#") + "h", text_color=color.white, text_size=size.small, text_halign=text.align_right, bgcolor=color.new(#ff0000, 0))
+    else
+        f_cell(17, "Entry Gov", str.tostring(govCount) + " / " + str.tostring(i_govMaxTrades) + " in " + str.tostring(i_govWindowHrs, "#.#") + "h", govCount >= i_govMaxTrades - 1 ? #ff9800 : color.white)
+
+    f_cell(18, "Signal Pos", serverInPos ? "IN POSITION" : "FLAT", serverInPos ? #00e676 : #aaaaaa)
+    f_cell(19, "Cur P&L%", qty > 0 ? str.tostring(curPnlPct, "#.##") + "%" : "—", cpCol)
+
+    if killed
+        table.cell(dash, 0, 20, "State", text_color=#aaaaaa, text_size=size.small, text_halign=text.align_left)
+        table.cell(dash, 1, 20, "☠️ KILLED (entries paused)", text_color=color.white, text_size=size.small, text_halign=text.align_right, bgcolor=color.new(#ff0000, 0))
+    else if govGated
+        table.cell(dash, 0, 20, "State", text_color=#aaaaaa, text_size=size.small, text_halign=text.align_left)
+        table.cell(dash, 1, 20, "⛔ GOV GATED (no entries)", text_color=color.white, text_size=size.small, text_halign=text.align_right, bgcolor=color.new(#9c27b0, 0))
+    else if qty == 0 and rev
+        table.cell(dash, 0, 20, "State", text_color=#aaaaaa, text_size=size.small, text_halign=text.align_left)
+        table.cell(dash, 1, 20, "⌛ WAIT " + str.tostring(math.max(0, slBar + i_wait + 1 - bar_index)) + "b", text_color=color.black, text_size=size.small, text_halign=text.align_right, bgcolor=color.new(#ffd600, 0))
+    else
+        f_cell(20, "State", dir == 1 ? "LONG-CE" : "LONG-PE", dir == 1 ? #00e676 : #ff1744)
+
+    eqCol = curEquity >= 10000.0 ? #00e676 : #ff1744
+    table.cell(dash, 0, 21, "Equity (sim)", text_color=#aaaaaa, text_size=size.small, text_halign=text.align_left)
+    table.cell(dash, 1, 21, "₹" + str.tostring(curEquity, "#.##"), text_color=eqCol, text_size=size.small, text_halign=text.align_right, bgcolor=curEquity >= 10000.0 ? color.new(#00c853, 80) : color.new(#ff1744, 80))
+
+    retSign = returnPct >= 0 ? "+" : ""
+    retCol = returnPct >= 0 ? #00e676 : #ff1744
+    table.cell(dash, 0, 22, "Return % (spot sim)", text_color=#aaaaaa, text_size=size.small, text_halign=text.align_left)
+    table.cell(dash, 1, 22, retSign + str.tostring(returnPct, "#.##") + "%", text_color=retCol, text_size=size.small, text_halign=text.align_right, bgcolor=returnPct >= 0 ? color.new(#00c853, 80) : color.new(#ff1744, 80))
+
+    float curMonthStart = not na(prevMonthEquity) ? prevMonthEquity : 10000.0
+    if curMonthStart != 0
+        float curMoRet = (curEquity - curMonthStart) / curMonthStart * 100
+        array.push(monthlyReturns, curMoRet)
+    int   moCount  = array.size(monthlyReturns)
+    float avgMoRet = moCount > 0 ? array.avg(monthlyReturns) : 0.0
+    string avgMoSign = avgMoRet >= 0 ? "+" : ""
+    color  avgMoCol  = avgMoRet >= 0 ? #00e676 : #ff1744
+    table.cell(dash, 0, 23, "Avg Mo Ret%", text_color=#aaaaaa, text_size=size.small, text_halign=text.align_left)
+    table.cell(dash, 1, 23, avgMoSign + str.tostring(avgMoRet, "#.##") + "% (" + str.tostring(moCount) + "mo)", text_color=avgMoCol, text_size=size.small, text_halign=text.align_right, bgcolor=avgMoRet >= 0 ? color.new(#00c853, 80) : color.new(#ff1744, 80))
+    if moCount > 0
+        array.pop(monthlyReturns)
+
+    minPnlStr = i_minPnl == 0.0 ? "OFF" : str.tostring(i_minPnl, "#.#") + "%"
+    f_cell(24, "Kill @", minPnlStr, i_minPnl == 0.0 ? #aaaaaa : (killed ? #ff1744 : #ff9800))
+
+    resumeAt = i_minPnl + i_resumeBuffer
+    resumeStr = i_minPnl == 0.0 ? "OFF" : str.tostring(resumeAt, "#.#") + "%"
+    f_cell(25, "Resume @", resumeStr, i_minPnl == 0.0 ? #aaaaaa : (killed ? #ff9800 : #00e676))
+
+    f_cell(26, "Avg Win/Loss %", str.tostring(avgWinPct, "#.##") + "% / " + str.tostring(avgLossPct, "#.##") + "%", color.white)
+    float bestW  = na(bestWinPct)   ? 0.0 : bestWinPct
+    float worstL = na(worstLossPct) ? 0.0 : worstLossPct
+    f_cell(27, "Best/Worst %", str.tostring(bestW, "#.##") + "% / " + str.tostring(worstL, "#.##") + "%", color.white)
