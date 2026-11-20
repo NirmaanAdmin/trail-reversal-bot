@@ -728,6 +728,17 @@ LADDER_VERBOSE       = os.environ.get("LADDER_VERBOSE", "false").lower() == "tru
 # TP_PCT is a PRICE %, not ROE: 4% at 5x leverage ≈ +20% on margin.
 EXIT_MODE            = os.environ.get("EXIT_MODE", "single").strip().lower()
 TP_PCT               = float(os.environ.get("TP_PCT", "4.0"))
+# ── Exchange-side TP/SL (single mode only) ──────────────────────────────────
+# When true, as soon as a position is confirmed on CoinDCX the server places
+# its TP (TP_PCT) and SL (SL_PCT) ON THE EXCHANGE via positions/create_tpsl
+# (take_profit_market / stop_market trigger orders). CoinDCX then fires them
+# the moment price touches — no EXIT_POLL_SEC sampling, no proxy round trip.
+# While those orders are live the server's own poll-based TP/SL is skipped for
+# that symbol (two closers racing could open a reverse position, because closes
+# here are not reduce-only). If placement fails, the server's poll TP/SL stays
+# in charge for that position as before. Default false ⇒ no change on deploy.
+EXCHANGE_TPSL_ENABLED = os.environ.get("EXCHANGE_TPSL_ENABLED", "false").lower() == "true"
+EXCHANGE_TPSL_MAX_TRIES = int(os.environ.get("EXCHANGE_TPSL_MAX_TRIES", "3"))
 
 
 def _fmt_px(x):
@@ -983,6 +994,7 @@ def fetch_real_positions_map():
                 "active_pos": qty,
                 "avg_price": float(p.get("avg_price", 0) or 0),
                 "mark_price": float(p.get("mark_price", 0) or 0),
+                "id": p.get("id"),   # position id — fixed per pair on CoinDCX
             }
         return result
     except Exception as e:
@@ -2426,8 +2438,76 @@ def place_native_sl(symbol, side, qty, sl_price, leverage, margin_ccy):
     return
 
 
+# ═══════════════════════════════════════════════════════════
+#  EXCHANGE TP/SL — positions/create_tpsl (trigger orders on CoinDCX)
+# ═══════════════════════════════════════════════════════════
+exchange_tpsl = {}  # {symbol: {"pos_id": ..., "tp": ..., "sl": ...}}
+
+def place_exchange_tpsl(symbol, pos_id, side, avg):
+    """Place TP (take_profit_market) + SL (stop_market) on the exchange for the
+    position `pos_id`, measured off the real avg fill. Returns True when every
+    leg that is switched on (TP_PCT>0 / SL_PCT>0) was accepted."""
+    if not pos_id or not avg or avg <= 0:
+        return False
+    tick = get_tick_size(symbol)
+    body = {"id": pos_id}
+    tp = sl = None
+    if TP_PCT > 0:
+        raw = avg * (1 + TP_PCT / 100.0) if side == "buy" else avg * (1 - TP_PCT / 100.0)
+        tp = round_to_tick(raw, tick) if side == "buy" else round_up_to_tick(raw, tick)
+        body["take_profit"] = {"stop_price": str(tp), "order_type": "take_profit_market"}
+    if SL_PCT > 0:
+        raw = avg * (1 - SL_PCT / 100.0) if side == "buy" else avg * (1 + SL_PCT / 100.0)
+        sl = round_to_tick(raw, tick) if side == "buy" else round_up_to_tick(raw, tick)
+        body["stop_loss"] = {"stop_price": str(sl), "order_type": "stop_market"}
+    if tp is None and sl is None:
+        return False
+    try:
+        resp = _sign_post("/exchange/v1/derivatives/futures/positions/create_tpsl", body)
+        txt = resp.text[:400]
+        if resp.status_code != 200:
+            log.warning(f"⚠️ EXCHANGE TP/SL rejected {symbol}: HTTP {resp.status_code} {txt}")
+            return False
+        data = resp.json() if resp.content else {}
+        errs = []
+        if isinstance(data, dict):
+            for leg in ("take_profit", "stop_loss"):
+                d = data.get(leg)
+                if isinstance(d, dict) and d.get("error"):
+                    errs.append(f"{leg}: {d.get('error')}")
+        if errs:
+            log.warning(f"⚠️ EXCHANGE TP/SL partial for {symbol}: {'; '.join(errs)} | {txt}")
+            return False
+        exchange_tpsl[symbol] = {"pos_id": pos_id, "tp": tp, "sl": sl}
+        log.info(f"🏦 EXCHANGE TP/SL set: {symbol} {side.upper()} avg={avg} "
+                 f"TP={_fmt_px(tp)} SL={_fmt_px(sl)} (pos {pos_id})")
+        return True
+    except Exception as e:
+        log.warning(f"⚠️ EXCHANGE TP/SL error for {symbol}: {e}")
+        return False
+
+
+def cancel_exchange_tpsl(symbol):
+    """Cancel every open order on the symbol's position (TP/SL legs included).
+    The position id is fixed per pair, so a leftover TP/SL would otherwise act
+    on the NEXT position in this pair (e.g. the new leg of a flip)."""
+    info = exchange_tpsl.pop(symbol, None)
+    if not info or not info.get("pos_id"):
+        return
+    try:
+        resp = _sign_post("/exchange/v1/derivatives/futures/positions/cancel_all_open_orders_for_position",
+                          {"id": info["pos_id"]})
+        if resp.status_code == 200:
+            log.info(f"🏦 EXCHANGE TP/SL cancelled: {symbol}")
+        else:
+            log.warning(f"⚠️ EXCHANGE TP/SL cancel {symbol}: HTTP {resp.status_code} {resp.text[:200]}")
+    except Exception as e:
+        log.warning(f"⚠️ EXCHANGE TP/SL cancel error for {symbol}: {e}")
+
+
 def cancel_native_sl(symbol):
-    """Cancel existing native SL order."""
+    """Cancel existing native SL order (and any exchange TP/SL on the position)."""
+    cancel_exchange_tpsl(symbol)
     if symbol not in native_sl_orders:
         return
 
@@ -4245,6 +4325,16 @@ def _ladder_step(sym, pos, mark):
     global _server_exit_closes
     with _trade_lock:
         trade = active_trades.get(sym)
+        if trade and not pos and trade.get("tpsl_set"):
+            # Exchange TP/SL already closed it — drop tracking so the next Pine
+            # entry is not skipped as "already active". Grace covers entry lag.
+            age = time.time() - float(trade.get("entry_time", 0) or 0)
+            if age >= RECONCILE_GRACE_SEC:
+                clear_active_trade(sym, "exchange TP/SL filled (position flat)")
+                log_trade_event(sym, trade.get("side", ""), "exchange_tpsl", "FILLED",
+                                "position flat on CoinDCX")
+                _server_exit_closes += 1
+            return
         if not trade or not pos:
             return  # not tracked, or not confirmed on the exchange yet
         side    = pos["side"]
@@ -4285,6 +4375,26 @@ def _ladder_step(sym, pos, mark):
                      + (f" TP={TP_PCT}% → "
                         f"{avg * (1 + TP_PCT / 100.0) if side == 'buy' else avg * (1 - TP_PCT / 100.0):.8f}"
                         if EXIT_MODE != "ladder" else ""))
+
+        # ── 1b. EXCHANGE TP/SL (single mode) — hand the exits to CoinDCX ──
+        if EXCHANGE_TPSL_ENABLED and EXIT_MODE != "ladder":
+            if trade.get("tpsl_set"):
+                if sym not in exchange_tpsl and pos.get("id"):
+                    # after a restart: remember the position id so a later
+                    # close / flip still cancels the resting TP/SL legs
+                    exchange_tpsl[sym] = {"pos_id": pos.get("id"), "tp": None, "sl": None}
+                return  # exchange owns TP/SL for this position
+            tries = int(trade.get("tpsl_tries", 0))
+            if tries < EXCHANGE_TPSL_MAX_TRIES:
+                trade["tpsl_tries"] = tries + 1
+                if place_exchange_tpsl(sym, pos.get("id"), side, float(trade["avg_entry"])):
+                    trade["tpsl_set"] = True
+                    _save_active_trades()
+                    return
+                if trade["tpsl_tries"] >= EXCHANGE_TPSL_MAX_TRIES:
+                    log.warning(f"⚠️ EXCHANGE TP/SL gave up for {sym} after {EXCHANGE_TPSL_MAX_TRIES} "
+                                f"tries — server poll TP/SL stays in charge of this position")
+            # not set → fall through to the server's own poll TP/SL
 
         avg    = float(trade["avg_entry"])
         cur_sl = trade.get("ladder_sl")
@@ -4580,6 +4690,8 @@ _server_exit_thread = threading.Thread(target=server_exit_worker, daemon=True)
 _server_exit_thread.start()
 log.info(f"🛡️ Server-exit initialized — enabled={SERVER_EXITS_ENABLED}, "
          f"mode={EXIT_MODE} TP={TP_PCT}% SL={SL_PCT}%, poll={EXIT_POLL_SEC}s")
+log.info(f"🏦 Exchange TP/SL (create_tpsl): {'ON' if EXCHANGE_TPSL_ENABLED and EXIT_MODE != 'ladder' else 'OFF'}"
+         f" — needs SERVER_EXITS_ENABLED=true and EXIT_MODE=single")
 # Pine-flip on opposite-direction entry is coupled to SERVER_EXITS_ENABLED (see the
 # entry handler). Log it so the build is confirmable from the boot line.
 log.info(f"🔄 Pine-flip on opposite entry: {'ON' if SERVER_EXITS_ENABLED else 'OFF'} "
