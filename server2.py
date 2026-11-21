@@ -2443,48 +2443,74 @@ def place_native_sl(symbol, side, qty, sl_price, leverage, margin_ccy):
 # ═══════════════════════════════════════════════════════════
 exchange_tpsl = {}  # {symbol: {"pos_id": ..., "tp": ..., "sl": ...}}
 
-def place_exchange_tpsl(symbol, pos_id, side, avg):
-    """Place TP (take_profit_market) + SL (stop_market) on the exchange for the
-    position `pos_id`, measured off the real avg fill. Returns True when every
-    leg that is switched on (TP_PCT>0 / SL_PCT>0) was accepted."""
-    if not pos_id or not avg or avg <= 0:
-        return False
-    tick = get_tick_size(symbol)
-    body = {"id": pos_id}
+# Futures TP/SL price tick, learned from CoinDCX's own rejection. The tick
+# cache above comes from the SPOT /markets_details feed, which for some pairs is
+# finer than the futures price step (B-BTW_USDT: spot 6 decimals, futures
+# trigger price must be divisible by 0.0001 → HTTP 422 FUTURES_TPSL_ERR_000).
+tpsl_tick_cache = {}  # {symbol: tick}
+
+def _tpsl_levels(side, avg, tick):
+    """TP/SL trigger prices off the avg fill, rounded to `tick`: TP rounds
+    toward entry (never further than TP_PCT), SL rounds away from entry (never
+    tighter than SL_PCT)."""
     tp = sl = None
     if TP_PCT > 0:
         raw = avg * (1 + TP_PCT / 100.0) if side == "buy" else avg * (1 - TP_PCT / 100.0)
         tp = round_to_tick(raw, tick) if side == "buy" else round_up_to_tick(raw, tick)
-        body["take_profit"] = {"stop_price": str(tp), "order_type": "take_profit_market"}
     if SL_PCT > 0:
         raw = avg * (1 - SL_PCT / 100.0) if side == "buy" else avg * (1 + SL_PCT / 100.0)
         sl = round_to_tick(raw, tick) if side == "buy" else round_up_to_tick(raw, tick)
-        body["stop_loss"] = {"stop_price": str(sl), "order_type": "stop_market"}
-    if tp is None and sl is None:
+    return tp, sl
+
+
+def place_exchange_tpsl(symbol, pos_id, side, avg):
+    """Place TP (take_profit_market) + SL (stop_market) on the exchange for the
+    position `pos_id`, measured off the real avg fill. Returns True when every
+    leg that is switched on (TP_PCT>0 / SL_PCT>0) was accepted.
+    Self-heals a price-tick rejection ("Price should be divisible by X"): learns
+    X for this symbol, re-rounds, and retries once within the same call."""
+    if not pos_id or not avg or avg <= 0:
         return False
-    try:
-        resp = _sign_post("/exchange/v1/derivatives/futures/positions/create_tpsl", body)
-        txt = resp.text[:400]
-        if resp.status_code != 200:
-            log.warning(f"⚠️ EXCHANGE TP/SL rejected {symbol}: HTTP {resp.status_code} {txt}")
+    tick = tpsl_tick_cache.get(symbol) or get_tick_size(symbol)
+    for attempt in (1, 2):
+        tp, sl = _tpsl_levels(side, avg, tick)
+        if tp is None and sl is None:
             return False
-        data = resp.json() if resp.content else {}
-        errs = []
-        if isinstance(data, dict):
-            for leg in ("take_profit", "stop_loss"):
-                d = data.get(leg)
-                if isinstance(d, dict) and d.get("error"):
-                    errs.append(f"{leg}: {d.get('error')}")
-        if errs:
-            log.warning(f"⚠️ EXCHANGE TP/SL partial for {symbol}: {'; '.join(errs)} | {txt}")
+        body = {"id": pos_id}
+        if tp is not None:
+            body["take_profit"] = {"stop_price": str(tp), "order_type": "take_profit_market"}
+        if sl is not None:
+            body["stop_loss"] = {"stop_price": str(sl), "order_type": "stop_market"}
+        try:
+            resp = _sign_post("/exchange/v1/derivatives/futures/positions/create_tpsl", body)
+            txt = resp.text[:400]
+            if resp.status_code != 200:
+                learned = _parse_step_from_error(txt)
+                if attempt == 1 and learned and learned != tick:
+                    log.info(f"🏦 EXCHANGE TP/SL tick learned for {symbol}: {tick} → {learned} — retrying")
+                    tpsl_tick_cache[symbol] = learned
+                    tick = learned
+                    continue
+                log.warning(f"⚠️ EXCHANGE TP/SL rejected {symbol}: HTTP {resp.status_code} {txt}")
+                return False
+            data = resp.json() if resp.content else {}
+            errs = []
+            if isinstance(data, dict):
+                for leg in ("take_profit", "stop_loss"):
+                    d = data.get(leg)
+                    if isinstance(d, dict) and d.get("error"):
+                        errs.append(f"{leg}: {d.get('error')}")
+            if errs:
+                log.warning(f"⚠️ EXCHANGE TP/SL partial for {symbol}: {'; '.join(errs)} | {txt}")
+                return False
+            exchange_tpsl[symbol] = {"pos_id": pos_id, "tp": tp, "sl": sl}
+            log.info(f"🏦 EXCHANGE TP/SL set: {symbol} {side.upper()} avg={avg} "
+                     f"TP={_fmt_px(tp)} SL={_fmt_px(sl)} tick={tick} (pos {pos_id})")
+            return True
+        except Exception as e:
+            log.warning(f"⚠️ EXCHANGE TP/SL error for {symbol}: {e}")
             return False
-        exchange_tpsl[symbol] = {"pos_id": pos_id, "tp": tp, "sl": sl}
-        log.info(f"🏦 EXCHANGE TP/SL set: {symbol} {side.upper()} avg={avg} "
-                 f"TP={_fmt_px(tp)} SL={_fmt_px(sl)} (pos {pos_id})")
-        return True
-    except Exception as e:
-        log.warning(f"⚠️ EXCHANGE TP/SL error for {symbol}: {e}")
-        return False
+    return False
 
 
 def cancel_exchange_tpsl(symbol):
